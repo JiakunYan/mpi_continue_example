@@ -6,12 +6,13 @@ namespace bench {
     struct parcel_t {
         int peer_rank;
         std::vector<msg_t> msgs;
+        void *local_context;
     };
     class context_t {
     public:
         void setup(int rank, int nranks, int argc, char *argv[]) {
             nparcels = 1000;
-            nchunks = 0;
+            nchunks = 4;
             chunk_size = 8192;
             send_count = 0;
             send_comp_count = 0;
@@ -29,9 +30,11 @@ namespace bench {
                     // the sender
                     send_comp_expected = nparcels;
                     recv_comp_expected = 0;
+                    recv_done_flag = true;
                 } else {
                     // the receiver
                     send_comp_expected = 0;
+                    send_done_flag = true;
                     recv_comp_expected = nparcels;
                 }
             }
@@ -39,7 +42,7 @@ namespace bench {
 
         parcel_t *get_parcel() {
             parcel_t *parcel = nullptr;
-            if (++send_count <= nparcels) {
+            if (++send_count <= send_comp_expected) {
                 parcel = new parcel_t;
                 parcel->peer_rank = peer_rank;
                 parcel->msgs.resize(nchunks);
@@ -51,22 +54,24 @@ namespace bench {
         }
         bool signal_send_comp() {
             int count = ++send_comp_count;
-            if (count >= send_comp_expected) {
+            if (count == send_comp_expected) {
                 if (!send_done_flag)
                     send_done_flag = true;
                 return true;
             } else {
+                assert(count < send_comp_expected);
                 return false;
             }
         }
         bool signal_recv_comp(parcel_t *parcel) {
             delete parcel;
             int count = ++recv_comp_count;
-            if (count >= recv_comp_expected) {
+            if (count == recv_comp_expected) {
                 if (!recv_done_flag)
                     recv_done_flag = true;
                 return true;
             } else {
+                assert(count < recv_comp_expected);
                 return false;
             }
         }

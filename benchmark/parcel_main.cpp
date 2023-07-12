@@ -25,9 +25,30 @@ bench::context_t g_context;
 int g_max_tag;
 alignas(64) std::atomic<int> g_next_tag(0);
 alignas(64) std::atomic<bool> g_progress_flag(false);
+const int MAX_HEADER_SIZE = 1024;
+
+std::vector<int> *encode_header(int tag, bench::parcel_t *parcel) {
+    auto *header = new std::vector<int>;
+    header->push_back(tag);
+    header->push_back(static_cast<int>(parcel->msgs.size()));
+    for (const auto& chunk : parcel->msgs) {
+        header->push_back(static_cast<int>(chunk.size()));
+    }
+    return header;
+}
+
+void decode_header(const std::vector<int>& header, int *tag, bench::parcel_t *parcel) {
+    *tag = header[0];
+    parcel->msgs.resize(header[1]);
+    for (int i = 0; i < parcel->msgs.size(); ++i) {
+        parcel->msgs[i].resize(header[2 + i]);
+    }
+}
 
 int sender_callback(int error_code, void *user_data) {
     auto *parcel = static_cast<bench::parcel_t*>(user_data);
+    auto *header = static_cast<std::vector<int>*>(parcel->local_context);
+    delete header;
     delete parcel;
     g_context.signal_send_comp();
     return MPI_SUCCESS;
@@ -44,10 +65,13 @@ void try_send_parcel() {
     if (parcel) {
         // send the parcel
         int tag = g_next_tag++ % (g_max_tag - 1) + 1;
+        auto header = encode_header(tag, parcel);
+        parcel->local_context = header;
         std::vector<MPI_Request> requests;
         MPI_Request request;
         // header messages always use tag 0.
-        MPI_SAFECALL(MPI_Isend(&tag, 1, MPI_INT, parcel->peer_rank, 0, MPI_COMM_WORLD, &request));
+        MPI_SAFECALL(MPI_Isend(header->data(), header->size(), MPI_INT,
+                               parcel->peer_rank, 0, MPI_COMM_WORLD, &request));
         requests.push_back(request);
         for (auto & chunk : parcel->msgs) {
             MPI_SAFECALL(MPI_Isend(chunk.data(), chunk.size(), MPI_CHAR,
@@ -60,31 +84,29 @@ void try_send_parcel() {
 }
 
 thread_local MPI_Request request_header = MPI_REQUEST_NULL;
-thread_local int recv_buffer;
+thread_local std::vector<int> recv_buffer(MAX_HEADER_SIZE);
 
 void try_receive_parcel() {
     if (request_header == MPI_REQUEST_NULL)
-        MPI_SAFECALL(MPI_Irecv(&recv_buffer, 1, MPI_INT, MPI_ANY_SOURCE, 0, MPI_COMM_WORLD, &request_header));
+        MPI_SAFECALL(MPI_Irecv(recv_buffer.data(), recv_buffer.size(), MPI_INT, MPI_ANY_SOURCE, 0, MPI_COMM_WORLD, &request_header));
 
     MPI_Status status;
-    int flag;
+    int flag = 0;
     MPI_SAFECALL(MPI_Test(&request_header, &flag, &status));
     if (flag) {
         // got a new header message
-        int tag = recv_buffer;
+        int tag;
+        auto *parcel = new bench::parcel_t;
+        decode_header(recv_buffer, &tag, parcel);
         assert(tag > 0);
         // post a new receive for header
-        MPI_SAFECALL(MPI_Irecv(&recv_buffer, 1, MPI_INT, MPI_ANY_SOURCE, 0, MPI_COMM_WORLD, &request_header));
+        MPI_SAFECALL(MPI_Irecv(recv_buffer.data(), recv_buffer.size(), MPI_INT, MPI_ANY_SOURCE, 0, MPI_COMM_WORLD, &request_header));
         // post the follow-up receives
-        // TODO: Ideally we should also tranfer the chunk number/size through the header message.
-        auto *parcel = new bench::parcel_t;
         parcel->peer_rank = status.MPI_SOURCE;
-        if (g_context.nchunks > 0) {
-            parcel->msgs.resize(g_context.nchunks);
+        if (!parcel->msgs.empty()) {
             std::vector<MPI_Request> requests;
             for (auto &chunk: parcel->msgs) {
                 MPI_Request request;
-                chunk.resize(g_context.chunk_size);
                 MPI_SAFECALL(MPI_Irecv(chunk.data(), chunk.size(), MPI_CHAR,
                                        status.MPI_SOURCE, tag, MPI_COMM_WORLD, &request));
                 requests.push_back(request);
@@ -103,27 +125,33 @@ void cancel_receive() {
     }
 }
 
+void do_progress() {
+    int flag;
+    MPI_SAFECALL(MPI_Test(&g_cont_req, &flag, MPI_STATUS_IGNORE));
+    if (flag) {
+        MPI_Start(&g_cont_req);
+    }
+}
+
 void worker_thread_fn(int thread_id) {
     // The sender
     while (!g_context.is_done()) {
         try_receive_parcel();
         try_send_parcel();
+        if (g_config.nthreads == 1)
+            do_progress();
     }
     cancel_receive();
 }
 
 void progress_thread_fn(int thread_id) {
     while (g_progress_flag) {
-        int flag;
-        MPI_SAFECALL(MPI_Test(&g_cont_req, &flag, MPI_STATUS_IGNORE));
-        if (flag) {
-            MPI_Start(&g_cont_req);
-        }
+        do_progress();
     }
 }
 
 int main(int argc, char *argv[]) {
-    // initialize the benchmark context
+    // initialize MPI
     int provided;
     MPI_Init_thread(&argc, &argv, MPI_THREAD_MULTIPLE, &provided);
     assert(provided == MPI_THREAD_MULTIPLE);
@@ -137,30 +165,36 @@ int main(int argc, char *argv[]) {
         g_max_tag = *(int*) max_tag_p;
     else
         g_max_tag = 32767;
-    // initialize MPI
+    MPI_Barrier(MPI_COMM_WORLD);
+    // initialize the benchmark context
     g_context.setup(g_rank, g_nranks, argc, argv);
 
     // initialize the continuation request
     MPIX_Continue_init(0, 0, MPI_INFO_NULL, &g_cont_req);
     MPI_Start(&g_cont_req);
 
-    // spawn the progress thread
-    g_progress_flag = true;
-    std::thread progress_thread(progress_thread_fn, 0);
-    // spawn the worker threads
-    std::vector<std::thread> worker_threads;
-    for (int i = 0; i < g_config.nthreads; ++i) {
-        worker_threads.emplace_back(worker_thread_fn, i);
+    if (g_config.nthreads == 1) {
+        worker_thread_fn(0);
+    } else {
+        // spawn the progress thread
+        g_progress_flag = true;
+        std::thread progress_thread(progress_thread_fn, g_config.nthreads - 1);
+        // spawn the worker threads
+        std::vector<std::thread> worker_threads;
+        for (int i = 0; i < g_config.nthreads - 1; ++i) {
+            worker_threads.emplace_back(worker_thread_fn, i);
+        }
+
+        // Wait for the worker threads to join
+        for (int i = 0; i < g_config.nthreads - 1; ++i) {
+            worker_threads[i].join();
+        }
+        // Wait for the progress threads to join
+        g_progress_flag = false;
+        progress_thread.join();
     }
 
-    // Wait for the worker threads to join
-    for (int i = 0; i < g_config.nthreads; ++i) {
-        worker_threads[i].join();
-    }
-    // Wait for the progress threads to join
-    g_progress_flag = false;
-    progress_thread.join();
-
+    MPI_Barrier(MPI_COMM_WORLD);
     MPI_Request_free(&g_cont_req);
     MPI_Finalize();
 }
