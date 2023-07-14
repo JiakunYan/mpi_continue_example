@@ -3,6 +3,7 @@
 #include <thread>
 #include <cassert>
 #include <atomic>
+#include <chrono>
 #include "mpi.h"
 #include "common.hpp"
 
@@ -14,10 +15,6 @@
             exit(1); \
         }\
     }
-
-struct config_t {
-    int nthreads = 8;
-} g_config;
 
 int g_rank, g_nranks;
 MPI_Request g_cont_req;
@@ -135,10 +132,11 @@ void do_progress() {
 
 void worker_thread_fn(int thread_id) {
     // The sender
+    bool need_progress = g_context.get_nthreads() == 1;
     while (!g_context.is_done()) {
         try_receive_parcel();
         try_send_parcel();
-        if (g_config.nthreads == 1)
+        if (need_progress)
             do_progress();
     }
     cancel_receive();
@@ -151,6 +149,11 @@ void progress_thread_fn(int thread_id) {
 }
 
 int main(int argc, char *argv[]) {
+//    bool wait_for_dbg = true;
+//    while (wait_for_dbg) continue;
+    // initialize the benchmark context
+    g_context.parse_args(argc, argv);
+    int nthreads = g_context.get_nthreads();
     // initialize MPI
     int provided;
     MPI_Init_thread(&argc, &argv, MPI_THREAD_MULTIPLE, &provided);
@@ -165,28 +168,29 @@ int main(int argc, char *argv[]) {
         g_max_tag = *(int*) max_tag_p;
     else
         g_max_tag = 32767;
-    MPI_Barrier(MPI_COMM_WORLD);
-    // initialize the benchmark context
-    g_context.setup(g_rank, g_nranks, argc, argv);
+    // Setup problem
+    g_context.setup(g_rank, g_nranks);
 
     // initialize the continuation request
     MPIX_Continue_init(0, 0, MPI_INFO_NULL, &g_cont_req);
     MPI_Start(&g_cont_req);
+    MPI_Barrier(MPI_COMM_WORLD);
+    auto start = std::chrono::high_resolution_clock::now();
 
-    if (g_config.nthreads == 1) {
+    if (nthreads == 1) {
         worker_thread_fn(0);
     } else {
         // spawn the progress thread
         g_progress_flag = true;
-        std::thread progress_thread(progress_thread_fn, g_config.nthreads - 1);
+        std::thread progress_thread(progress_thread_fn, nthreads - 1);
         // spawn the worker threads
         std::vector<std::thread> worker_threads;
-        for (int i = 0; i < g_config.nthreads - 1; ++i) {
+        for (int i = 0; i < nthreads - 1; ++i) {
             worker_threads.emplace_back(worker_thread_fn, i);
         }
 
         // Wait for the worker threads to join
-        for (int i = 0; i < g_config.nthreads - 1; ++i) {
+        for (int i = 0; i < nthreads - 1; ++i) {
             worker_threads[i].join();
         }
         // Wait for the progress threads to join
@@ -195,6 +199,10 @@ int main(int argc, char *argv[]) {
     }
 
     MPI_Barrier(MPI_COMM_WORLD);
+    auto end = std::chrono::high_resolution_clock::now();
+    auto total_time = std::chrono::duration_cast<std::chrono::duration<double>>(end - start);
+    g_context.report(total_time.count());
+
     MPI_Request_free(&g_cont_req);
     MPI_Finalize();
 }

@@ -1,5 +1,6 @@
 #ifndef MPI_CONTINUE_EXAMPLE_COMMON_HPP
 #define MPI_CONTINUE_EXAMPLE_COMMON_HPP
+#include <unistd.h>
 
 namespace bench {
     typedef std::vector<char> msg_t;
@@ -10,10 +11,29 @@ namespace bench {
     };
     class context_t {
     public:
-        void setup(int rank, int nranks, int argc, char *argv[]) {
-            nparcels = 1000;
+        void parse_args(int argc, char *argv[]) {
+            nparcels = 10000;
             nchunks = 4;
             chunk_size = 8192;
+            nthreads = 8;
+            is_verbose = false;
+            int opt;
+            while ((opt = getopt(argc, argv, "p:c:s:t:v")) != -1) {
+                switch (opt) {
+                    case 'p': nparcels = std::stoi(optarg); break;
+                    case 'c': nchunks = std::stoi(optarg); break;
+                    case 's': chunk_size = std::stoi(optarg); break;
+                    case 't': nthreads = std::stoi(optarg); break;
+                    case 'v': is_verbose = true; break;
+                    default:
+                        fprintf(stderr, "Usage: %s [-ilw] [file...]\n", argv[0]);
+                        exit(EXIT_FAILURE);
+                }
+            }
+        }
+        void setup(int rank_, int nranks_) {
+            rank = rank_;
+            nranks = nranks_;
             send_count = 0;
             send_comp_count = 0;
             recv_comp_count = 0;
@@ -40,14 +60,22 @@ namespace bench {
             }
         }
 
+        int get_nthreads() const {
+            return nthreads;
+        }
+
         parcel_t *get_parcel() {
             parcel_t *parcel = nullptr;
-            if (++send_count <= send_comp_expected) {
-                parcel = new parcel_t;
-                parcel->peer_rank = peer_rank;
-                parcel->msgs.resize(nchunks);
-                for (auto &chunk: parcel->msgs) {
-                    chunk.resize(chunk_size);
+            int count = send_count;
+            if (count < send_comp_expected) {
+                count = ++send_count;
+                if (count <= send_comp_expected) {
+                    parcel = new parcel_t;
+                    parcel->peer_rank = peer_rank;
+                    parcel->msgs.resize(nchunks);
+                    for (auto &chunk: parcel->msgs) {
+                        chunk.resize(chunk_size);
+                    }
                 }
             }
             return parcel;
@@ -78,8 +106,21 @@ namespace bench {
         bool is_done() {
             return send_done_flag && recv_done_flag;
         }
-//    private:
-        int nparcels, nchunks, chunk_size;
+        void report(double total_time) {
+            if (rank == 0) {
+                std::cout
+                        << "nparcels: " << nparcels << "\n"
+                        << "nchunks: " << nchunks << "\n"
+                        << "chunk_size (B): " << chunk_size << "\n"
+                        << "nthreads: " << nthreads << "\n"
+                        << "nranks: " << nranks << "\n"
+                        << "Total time (s): " << total_time << std::endl;
+            }
+        }
+    private:
+        int nparcels, nchunks, chunk_size, nthreads;
+        bool is_verbose;
+        int rank, nranks;
         int send_comp_expected, recv_comp_expected, peer_rank;
         alignas(64) std::atomic<int> send_count;
         alignas(64) std::atomic<int> send_comp_count;
