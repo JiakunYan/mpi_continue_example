@@ -1,8 +1,61 @@
 #ifndef MPI_CONTINUE_EXAMPLE_COMMON_HPP
 #define MPI_CONTINUE_EXAMPLE_COMMON_HPP
 #include <unistd.h>
+#include <getopt.h>
+#include <cstring>
 
 namespace bench {
+    class args_parser_t {
+    public:
+        struct dict_entry_t {
+            std::string key;
+            int val;
+            dict_entry_t(const char *key_, int val_) : key(key_), val(val_) {}
+        };
+        void add(const std::string& name, int has_arg, int *ptr,
+                 const std::vector<dict_entry_t> &dict = {}) {
+            args.push_back({name, has_arg, ptr, dict});
+        }
+
+        void parse_args(int argc, char *argv[]) {
+            int long_flag;
+            std::vector<struct option> long_options;
+            long_options.reserve(args.size() + 1);
+            for (int i = 0; i < args.size(); ++i) {
+                long_options.push_back({args[i].name.c_str(), args[i].has_arg, &long_flag, i});
+            }
+            long_options.push_back({nullptr, 0, nullptr, 0});
+            while (getopt_long(argc, argv, "", long_options.data(), nullptr) == 0) {
+                int i = long_flag;
+                if (args[i].has_arg == no_argument) {
+                    *args[i].ptr = 1;
+                    continue;
+                } else {
+                    bool found = false;
+                    for (const auto &item: args[i].dict) {
+                        if (item.key == optarg) {
+                            *args[i].ptr = item.val;
+                            found = true;
+                            break;
+                        }
+                    }
+                    if (!found) {
+                        *args[i].ptr = std::stoi(optarg);
+                    }
+                }
+                printf("Assign %d to %s\n", *args[i].ptr, args[i].name.c_str());
+            }
+        }
+    private:
+        struct arg_t {
+            std::string name;
+            int has_arg;
+            int *ptr;
+            std::vector<dict_entry_t> dict;
+        };
+        std::vector<arg_t> args;
+    };
+
     typedef std::vector<char> msg_t;
     struct parcel_t {
         int peer_rank;
@@ -11,25 +64,16 @@ namespace bench {
     };
     class context_t {
     public:
-        void parse_args(int argc, char *argv[]) {
+        void parse_args(int argc, char *argv[], args_parser_t args_parser = args_parser_t()) {
             nparcels = 10000;
             nchunks = 4;
             chunk_size = 8192;
             nthreads = 8;
-            is_verbose = false;
-            int opt;
-            while ((opt = getopt(argc, argv, "p:c:s:t:v")) != -1) {
-                switch (opt) {
-                    case 'p': nparcels = std::stoi(optarg); break;
-                    case 'c': nchunks = std::stoi(optarg); break;
-                    case 's': chunk_size = std::stoi(optarg); break;
-                    case 't': nthreads = std::stoi(optarg); break;
-                    case 'v': is_verbose = true; break;
-                    default:
-                        fprintf(stderr, "Usage: %s [-ilw] [file...]\n", argv[0]);
-                        exit(EXIT_FAILURE);
-                }
-            }
+            args_parser.add("nparcels", required_argument, &nparcels);
+            args_parser.add("nchunks", required_argument, &nchunks);
+            args_parser.add("chunk-size", required_argument, &chunk_size);
+            args_parser.add("nthreads", required_argument, &nthreads);
+            args_parser.parse_args(argc, argv);
         }
         void setup(int rank_, int nranks_) {
             rank = rank_;
@@ -107,6 +151,8 @@ namespace bench {
             return send_done_flag && recv_done_flag;
         }
         void report(double total_time) {
+            double msg_rate = nparcels / total_time;
+            double bandwidth = msg_rate * nchunks * chunk_size;
             if (rank == 0) {
                 std::cout
                         << "nparcels: " << nparcels << "\n"
@@ -114,12 +160,14 @@ namespace bench {
                         << "chunk_size (B): " << chunk_size << "\n"
                         << "nthreads: " << nthreads << "\n"
                         << "nranks: " << nranks << "\n"
-                        << "Total time (s): " << total_time << std::endl;
+                        << "Total time (s): " << total_time << "\n"
+                        << "Message Rate (K/s): " << msg_rate / 1e3 << "\n"
+                        << "Bandwidth (MB/s): " << bandwidth / 1e6
+                        << std::endl;
             }
         }
     private:
         int nparcels, nchunks, chunk_size, nthreads;
-        bool is_verbose;
         int rank, nranks;
         int send_comp_expected, recv_comp_expected, peer_rank;
         alignas(64) std::atomic<int> send_count;
