@@ -3,6 +3,7 @@
 #include <unistd.h>
 #include <getopt.h>
 #include <cstring>
+#include <utility>
 
 namespace bench {
     class args_parser_t {
@@ -41,9 +42,40 @@ namespace bench {
                     }
                     if (!found) {
                         *args[i].ptr = std::stoi(optarg);
+//                        printf("Assign %d to %s\n", *args[i].ptr, args[i].name.c_str());
+                    } else {
+//                        printf("Assign %d (%s) to %s\n", *args[i].ptr, optarg, args[i].name.c_str());
                     }
                 }
-                printf("Assign %d to %s\n", *args[i].ptr, args[i].name.c_str());
+            }
+        }
+
+        void print(bool verbose) {
+            if (!verbose) {
+                std::cout << "ArgsParser: {";
+            }
+            for (auto& arg : args) {
+                if (verbose) {
+                    std::string verbose_val;
+                    if (!arg.dict.empty()) {
+                        for (auto &item : arg.dict) {
+                            if (item.val == *arg.ptr) {
+                                verbose_val = item.key;
+                                break;
+                            }
+                        }
+                    }
+                    std::cout << "ArgsParser: " << arg.name << " = " << *arg.ptr;
+                    if (!verbose_val.empty()) {
+                        std::cout << "(" << verbose_val << ")";
+                    }
+                    std::cout << std::endl;
+                } else {
+                    std::cout << "\"" << arg.name << "\": " << *arg.ptr << ", ";
+                }
+            }
+            if (!verbose) {
+                std::cout << "}\n";
             }
         }
     private:
@@ -64,15 +96,18 @@ namespace bench {
     };
     class context_t {
     public:
-        void parse_args(int argc, char *argv[], args_parser_t args_parser = args_parser_t()) {
+        void parse_args(int argc, char *argv[], args_parser_t args_parser_ = args_parser_t()) {
+            args_parser = std::move(args_parser_);
             nparcels = 10000;
             nchunks = 4;
             chunk_size = 8192;
             nthreads = 8;
+            is_verbose = false;
             args_parser.add("nparcels", required_argument, &nparcels);
             args_parser.add("nchunks", required_argument, &nchunks);
             args_parser.add("chunk-size", required_argument, &chunk_size);
             args_parser.add("nthreads", required_argument, &nthreads);
+            args_parser.add("verbose", no_argument, &is_verbose);
             args_parser.parse_args(argc, argv);
         }
         void setup(int rank_, int nranks_) {
@@ -154,20 +189,35 @@ namespace bench {
             double msg_rate = nparcels / total_time;
             double bandwidth = msg_rate * nchunks * chunk_size;
             if (rank == 0) {
-                std::cout
-                        << "nparcels: " << nparcels << "\n"
-                        << "nchunks: " << nchunks << "\n"
-                        << "chunk_size (B): " << chunk_size << "\n"
-                        << "nthreads: " << nthreads << "\n"
-                        << "nranks: " << nranks << "\n"
-                        << "Total time (s): " << total_time << "\n"
-                        << "Message Rate (K/s): " << msg_rate / 1e3 << "\n"
-                        << "Bandwidth (MB/s): " << bandwidth / 1e6
-                        << std::endl;
+                args_parser.print(is_verbose);
+                if (is_verbose) {
+                    std::cout
+                            << "nparcels: " << nparcels << "\n"
+                            << "nchunks: " << nchunks << "\n"
+                            << "chunk_size (B): " << chunk_size << "\n"
+                            << "nthreads: " << nthreads << "\n"
+                            << "nranks: " << nranks << "\n"
+                            << "Total time (s): " << total_time << "\n"
+                            << "Message Rate (K/s): " << msg_rate / 1e3 << "\n"
+                            << "Bandwidth (MB/s): " << bandwidth / 1e6
+                            << std::endl;
+                } else {
+                    std::cout << "Result: {"
+                            << "\"nparcels\": " << nparcels << ", "
+                            << "\"nchunks\": " << nchunks << ", "
+                            << "\"chunk_size (B)\": " << chunk_size << ", "
+                            << "\"nthreads\": " << nthreads << ", "
+                            << "\"nranks\": " << nranks << ", "
+                            << "\"Total time (s)\": " << total_time << ", "
+                            << "\"Message Rate (K/s)\": " << msg_rate / 1e3 << ", "
+                            << "\"Bandwidth (MB/s)\": " << bandwidth / 1e6 << " }"
+                            << std::endl;
+                }
             }
         }
     private:
-        int nparcels, nchunks, chunk_size, nthreads;
+        args_parser_t args_parser;
+        int nparcels, nchunks, chunk_size, nthreads, is_verbose;
         int rank, nranks;
         int send_comp_expected, recv_comp_expected, peer_rank;
         alignas(64) std::atomic<int> send_count;
