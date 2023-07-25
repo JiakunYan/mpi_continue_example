@@ -28,6 +28,10 @@
 
 #include "mpi.h"
 
+#ifdef OMPI_MPI_H
+#include "mpi-ext.h"
+#endif
+
 /* Block a thread on a receive until we release it from the main thread */
 static void* thread_recv(void* data) {
   MPI_Request req;

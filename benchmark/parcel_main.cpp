@@ -8,6 +8,11 @@
 #include "mpi.h"
 #include "common.hpp"
 
+#ifdef OMPI_MPI_H
+#include "mpi-ext.h"
+#define MPIX_CONT_IMMEDIATE 0
+#endif
+
 #define MPI_SAFECALL(x) {      \
         int ret = (x); \
         if (ret != MPI_SUCCESS) { \

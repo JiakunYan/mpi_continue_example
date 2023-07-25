@@ -26,6 +26,10 @@
 
 #include "mpi.h"
 
+#ifdef OMPI_MPI_H
+#include "mpi-ext.h"
+#endif
+
 static int complete_cnt_cb(int status, void *user_data) {
   assert(user_data != NULL);
   assert(status == MPI_SUCCESS);
