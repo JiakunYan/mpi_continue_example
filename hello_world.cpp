@@ -1,3 +1,4 @@
+#include <iostream>
 #include "mpi.h"
 
 int main()
@@ -8,6 +9,7 @@ int main()
     MPI_Comm_rank(MPI_COMM_WORLD, &rank);
     MPI_Barrier(MPI_COMM_WORLD);
     printf("Hello world from %d/%d\n", rank, nranks);
+    MPI_Barrier(MPI_COMM_WORLD);
     MPI_Finalize();
     return 0;
 }

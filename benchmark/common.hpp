@@ -129,13 +129,15 @@ namespace bench {
                     // the sender
                     send_comp_expected = nparcels;
                     recv_comp_expected = 0;
-                    recv_done_flag = true;
                 } else {
                     // the receiver
                     send_comp_expected = 0;
-                    send_done_flag = true;
                     recv_comp_expected = nparcels;
                 }
+                if (send_comp_expected == 0)
+                    send_done_flag = true;
+                if (recv_comp_expected == 0)
+                    recv_done_flag = true;
             }
         }
 

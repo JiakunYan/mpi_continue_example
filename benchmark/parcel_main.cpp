@@ -268,6 +268,6 @@ int main(int argc, char *argv[]) {
     auto total_time = std::chrono::duration_cast<std::chrono::duration<double>>(end - start);
     g_context.report(total_time.count());
 
-//    MPI_SAFECALL(MPI_Finalize());
+    MPI_SAFECALL(MPI_Finalize());
     return 0;
 }
