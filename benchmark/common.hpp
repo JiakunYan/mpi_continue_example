@@ -4,6 +4,7 @@
 #include <getopt.h>
 #include <cstring>
 #include <utility>
+#include <chrono>
 
 namespace bench {
     class args_parser_t {
@@ -102,11 +103,13 @@ namespace bench {
             nchunks = 4;
             chunk_size = 8192;
             nthreads = 8;
+            input_inject_rate = 0;
             is_verbose = false;
             args_parser.add("nparcels", required_argument, &nparcels);
             args_parser.add("nchunks", required_argument, &nchunks);
             args_parser.add("chunk-size", required_argument, &chunk_size);
             args_parser.add("nthreads", required_argument, &nthreads);
+            args_parser.add("inject-rate", required_argument, &input_inject_rate);
             args_parser.add("verbose", no_argument, &is_verbose);
             args_parser.parse_args(argc, argv);
         }
@@ -139,6 +142,7 @@ namespace bench {
                 if (recv_comp_expected == 0)
                     recv_done_flag = true;
             }
+            start_time = std::chrono::high_resolution_clock::now();
         }
 
         int get_nthreads() const {
@@ -149,6 +153,14 @@ namespace bench {
             parcel_t *parcel = nullptr;
             int count = send_count;
             if (count < send_comp_expected) {
+                if (input_inject_rate) {
+                    // Check whether we would exceed injection rate.
+                    double elapsed_time = std::chrono::duration_cast<std::chrono::duration<double>>(
+                            std::chrono::high_resolution_clock::now() - start_time).count();
+                    double wouldbe_inject_rate = (count + 1) / elapsed_time;
+                    if (wouldbe_inject_rate > input_inject_rate)
+                        return nullptr;
+                }
                 count = ++send_count;
                 if (count <= send_comp_expected) {
                     parcel = new parcel_t;
@@ -156,6 +168,12 @@ namespace bench {
                     parcel->msgs.resize(nchunks);
                     for (auto &chunk: parcel->msgs) {
                         chunk.resize(chunk_size);
+                    }
+                    if (count == send_comp_expected) {
+                        // Calculate the actual injection rate
+                        double elapsed_time = std::chrono::duration_cast<std::chrono::duration<double>>(
+                                std::chrono::high_resolution_clock::now() - start_time).count();
+                        actual_inject_rate = send_comp_expected / elapsed_time;
                     }
                 }
             }
@@ -199,6 +217,8 @@ namespace bench {
                             << "chunk_size (B): " << chunk_size << "\n"
                             << "nthreads: " << nthreads << "\n"
                             << "nranks: " << nranks << "\n"
+                            << "Input Injection Rate (K/s): " << input_inject_rate / 1e3 << "\n"
+                            << "Actual Injection Rate (K/s): " << actual_inject_rate / 1e3 << "\n"
                             << "Total time (s): " << total_time << "\n"
                             << "Message Rate (K/s): " << msg_rate / 1e3 << "\n"
                             << "Bandwidth (MB/s): " << bandwidth / 1e6
@@ -210,6 +230,8 @@ namespace bench {
                             << "\"chunk_size (B)\": " << chunk_size << ", "
                             << "\"nthreads\": " << nthreads << ", "
                             << "\"nranks\": " << nranks << ", "
+                            << "\"Input Injection Rate (K/s)\": " << input_inject_rate / 1e3 << ", "
+                            << "\"Actual Injection Rate (K/s)\": " << actual_inject_rate / 1e3 << ", "
                             << "\"Total time (s)\": " << total_time << ", "
                             << "\"Message Rate (K/s)\": " << msg_rate / 1e3 << ", "
                             << "\"Bandwidth (MB/s)\": " << bandwidth / 1e6 << " }"
@@ -219,9 +241,11 @@ namespace bench {
         }
     private:
         args_parser_t args_parser;
-        int nparcels, nchunks, chunk_size, nthreads, is_verbose;
+        int nparcels, nchunks, chunk_size, nthreads, input_inject_rate, is_verbose;
+        std::chrono::high_resolution_clock::time_point start_time;
         int rank, nranks;
         int send_comp_expected, recv_comp_expected, peer_rank;
+        double actual_inject_rate;
         alignas(64) std::atomic<int> send_count;
         alignas(64) std::atomic<int> send_comp_count;
         alignas(64) std::atomic<int> recv_comp_count;
