@@ -30,6 +30,13 @@
 
 #ifdef OMPI_MPI_H
 #include "mpi-ext.h"
+#define MPIX_CONT_IMMEDIATE 0
+
+#ifndef OMPI_HAVE_MPI_EXT_CONTINUE
+#define MPIX_Continue_init(...) MPI_ERR_UNKNOWN
+#define MPIX_Continue(...) MPI_ERR_UNKNOWN
+#define MPIX_Continueall(...) MPI_ERR_UNKNOWN
+#endif
 #endif
 
 /* Block a thread on a receive until we release it from the main thread */

@@ -11,6 +11,12 @@
 #ifdef OMPI_MPI_H
 #include "mpi-ext.h"
 #define MPIX_CONT_IMMEDIATE 0
+
+#ifndef OMPI_HAVE_MPI_EXT_CONTINUE
+#define MPIX_Continue_init(...) MPI_ERR_UNKNOWN
+#define MPIX_Continue(...) MPI_ERR_UNKNOWN
+#define MPIX_Continueall(...) MPI_ERR_UNKNOWN
+#endif
 #endif
 
 #define MPI_SAFECALL(x) {      \
@@ -197,7 +203,8 @@ void do_progress() {
 }
 
 void worker_thread_fn(int thread_id) {
-    if (g_config.progress_type == config_t::progress_type_t::SHARED) {
+    if (g_config.progress_type == config_t::progress_type_t::SHARED &&
+        g_config.comp_type == config_t::comp_type_t::CONTINUE) {
         MPI_SAFECALL(MPIX_Continue_init(0, 0, MPI_INFO_NULL, &tls_cont_req));
         MPI_SAFECALL(MPI_Start(&tls_cont_req));
     }
@@ -208,7 +215,7 @@ void worker_thread_fn(int thread_id) {
             do_progress();
     }
     cancel_receive();
-    if (g_config.progress_type == config_t::progress_type_t::SHARED) {
+    if (tls_cont_req != MPI_REQUEST_NULL) {
         MPI_SAFECALL(MPI_Request_free(&tls_cont_req));
     }
 }
