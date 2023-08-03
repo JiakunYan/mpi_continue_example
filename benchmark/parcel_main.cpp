@@ -11,6 +11,7 @@
 #ifdef OMPI_MPI_H
 #include "mpi-ext.h"
 #define MPIX_CONT_IMMEDIATE 0
+#define MPIX_CONT_FORGET 0
 
 #ifndef OMPI_HAVE_MPI_EXT_CONTINUE
 #define MPIX_Continue_init(...) MPI_ERR_UNKNOWN
@@ -28,38 +29,6 @@
         }\
     }
 
-namespace detail {
-    typedef int (cb_fn_t)(int error_code, void *user_data);
-    struct pending_parcel_t {
-        std::vector<MPI_Request> requests;
-        cb_fn_t *cb;
-        void *context;
-    };
-    thread_local std::deque<pending_parcel_t*> pending_parcels;
-    void push(std::vector<MPI_Request>&& requests, cb_fn_t *cb, void *context) {
-        auto *parcel = new pending_parcel_t;
-        parcel->requests = std::move(requests);
-        parcel->cb = cb;
-        parcel->context = context;
-        pending_parcels.push_back(parcel);
-    }
-    bool progress() {
-        if (pending_parcels.empty())
-            return false;
-        auto *parcel = pending_parcels.front();
-        pending_parcels.pop_front();
-        int flag;
-        MPI_SAFECALL(MPI_Testall(parcel->requests.size(), parcel->requests.data(), &flag, MPI_STATUS_IGNORE));
-        if (flag) {
-            parcel->cb(MPI_SUCCESS, parcel->context);
-            return true;
-        } else {
-            pending_parcels.push_back(parcel);
-            return false;
-        }
-    }
-}
-
 struct config_t {
     enum class comp_type_t {
         REQUEST,
@@ -69,15 +38,104 @@ struct config_t {
         SHARED,
     } progress_type = progress_type_t::SHARED;
     int use_cont_imm = true;
+    int use_cont_forget = true;
     int use_thread_single = true;
-} g_config;
+};
+
+namespace detail {
+    class comp_manager_base_t {
+    public:
+        typedef int (cb_fn_t)(int error_code, void *user_data);
+        virtual void push(std::vector<MPI_Request>&& requests, cb_fn_t *cb, void *context) = 0;
+        virtual bool progress() = 0;
+        virtual void init_thread() {};
+        virtual void free_thread() {};
+    };
+    class comp_manager_request_t : public comp_manager_base_t {
+    public:
+        struct pending_parcel_t {
+            std::vector<MPI_Request> requests;
+            cb_fn_t *cb;
+            void *context;
+        };
+        void push(std::vector<MPI_Request>&& requests, cb_fn_t *cb, void *context) override {
+            auto *parcel = new pending_parcel_t;
+            parcel->requests = std::move(requests);
+            parcel->cb = cb;
+            parcel->context = context;
+            pending_parcels.push_back(parcel);
+        }
+        bool progress() override {
+            if (pending_parcels.empty())
+                return false;
+            auto *parcel = pending_parcels.front();
+            pending_parcels.pop_front();
+            int flag;
+            MPI_SAFECALL(MPI_Testall(parcel->requests.size(), parcel->requests.data(), &flag, MPI_STATUS_IGNORE));
+            if (flag) {
+                parcel->cb(MPI_SUCCESS, parcel->context);
+                return true;
+            } else {
+                pending_parcels.push_back(parcel);
+                return false;
+            }
+        }
+    private:
+        static thread_local std::deque<pending_parcel_t*> pending_parcels;
+    };
+    thread_local std::deque<comp_manager_request_t::pending_parcel_t*> comp_manager_request_t::pending_parcels;
+
+    class comp_manager_continue_t : public comp_manager_base_t {
+    public:
+        explicit comp_manager_continue_t(config_t config_) : config(config_) {}
+        void push(std::vector<MPI_Request>&& requests, cb_fn_t *cb, void *context) override {
+            int cont_flag = 0;
+            if (config.use_cont_imm)
+                cont_flag = MPIX_CONT_IMMEDIATE;
+            if (config.use_thread_single)
+                cont_flag = MPIX_CONT_FORGET;
+            MPI_SAFECALL(MPIX_Continueall(static_cast<int>(requests.size()), requests.data(), cb,
+                                          context, cont_flag, MPI_STATUSES_IGNORE, tls_cont_req));
+        }
+        bool progress() override {
+            if (config.use_cont_forget) {
+//                MPI_SAFECALL(MPIX_Stream_progress(MPIX_STREAM_NULL));
+            } else {
+                int flag;
+                MPI_SAFECALL(MPI_Test(&tls_cont_req, &flag, MPI_STATUS_IGNORE));
+                if (flag) {
+                    MPI_Start(&tls_cont_req);
+                }
+            }
+            return true;
+        }
+        void init_thread() override {
+            if (config.progress_type == config_t::progress_type_t::SHARED &&
+                config.comp_type == config_t::comp_type_t::CONTINUE) {
+                MPI_SAFECALL(MPIX_Continue_init(0, 0, MPI_INFO_NULL, &tls_cont_req));
+                MPI_SAFECALL(MPI_Start(&tls_cont_req));
+            }
+        }
+        void free_thread() override {
+            if (tls_cont_req != MPI_REQUEST_NULL) {
+                MPI_SAFECALL(MPI_Request_free(&tls_cont_req));
+            }
+        }
+    private:
+        static thread_local MPI_Request tls_cont_req;
+        config_t config;
+    };
+    thread_local MPI_Request comp_manager_continue_t::tls_cont_req = MPI_REQUEST_NULL;
+}
+
+config_t g_config;
 int g_rank, g_nranks;
 bench::context_t g_context;
+detail::comp_manager_base_t *g_comp_manger_p;
 int g_max_tag;
 alignas(64) std::atomic<int> g_next_tag(0);
 const int MAX_HEADER_SIZE = 1024;
 
-thread_local MPI_Request tls_cont_req = MPI_REQUEST_NULL;
 thread_local MPI_Request tls_request_header = MPI_REQUEST_NULL;
 thread_local std::vector<int> tls_recv_buffer(MAX_HEADER_SIZE);
 
@@ -132,15 +190,7 @@ void try_send_parcel() {
                                    parcel->peer_rank, tag, MPI_COMM_WORLD, &request));
             requests.push_back(request);
         }
-        if (g_config.comp_type == config_t::comp_type_t::REQUEST) {
-            detail::push(std::move(requests), sender_callback, parcel);
-        } else {
-            int cont_flag = 0;
-            if (g_config.use_cont_imm)
-                cont_flag = MPIX_CONT_IMMEDIATE;
-            MPIX_Continueall(static_cast<int>(requests.size()), requests.data(), sender_callback,
-                             parcel, cont_flag, MPI_STATUSES_IGNORE, tls_cont_req);
-        }
+        g_comp_manger_p->push(std::move(requests), sender_callback, parcel);
     }
 }
 
@@ -169,15 +219,7 @@ void try_receive_parcel() {
                                        status.MPI_SOURCE, tag, MPI_COMM_WORLD, &request));
                 requests.push_back(request);
             }
-            if (g_config.comp_type == config_t::comp_type_t::REQUEST) {
-                detail::push(std::move(requests), receiver_callback, parcel);
-            } else {
-                int cont_flag = 0;
-                if (g_config.use_cont_imm)
-                    cont_flag = MPIX_CONT_IMMEDIATE;
-                MPIX_Continueall(static_cast<int>(requests.size()), requests.data(), receiver_callback,
-                                 parcel, cont_flag, MPI_STATUSES_IGNORE, tls_cont_req);
-            }
+            g_comp_manger_p->push(std::move(requests), receiver_callback, parcel);
         } else {
             receiver_callback(MPI_SUCCESS, parcel);
         }
@@ -191,23 +233,11 @@ void cancel_receive() {
 }
 
 void do_progress() {
-    if (g_config.comp_type == config_t::comp_type_t::REQUEST) {
-        detail::progress();
-    } else {
-        int flag;
-        MPI_SAFECALL(MPI_Test(&tls_cont_req, &flag, MPI_STATUS_IGNORE));
-        if (flag) {
-            MPI_Start(&tls_cont_req);
-        }
-    }
+    g_comp_manger_p->progress();
 }
 
 void worker_thread_fn(int thread_id) {
-    if (g_config.progress_type == config_t::progress_type_t::SHARED &&
-        g_config.comp_type == config_t::comp_type_t::CONTINUE) {
-        MPI_SAFECALL(MPIX_Continue_init(0, 0, MPI_INFO_NULL, &tls_cont_req));
-        MPI_SAFECALL(MPI_Start(&tls_cont_req));
-    }
+    g_comp_manger_p->init_thread();
     while (!g_context.is_done()) {
         try_receive_parcel();
         try_send_parcel();
@@ -215,9 +245,7 @@ void worker_thread_fn(int thread_id) {
             do_progress();
     }
     cancel_receive();
-    if (tls_cont_req != MPI_REQUEST_NULL) {
-        MPI_SAFECALL(MPI_Request_free(&tls_cont_req));
-    }
+    g_comp_manger_p->free_thread();
 }
 
 int main(int argc, char *argv[]) {
@@ -230,6 +258,7 @@ int main(int argc, char *argv[]) {
                     {{"continue", (int)config_t::comp_type_t::CONTINUE},
                      {"request", (int)config_t::comp_type_t::REQUEST},});
     args_parser.add("cont-imm", required_argument, (int*)&g_config.use_cont_imm);
+    args_parser.add("cont-forget", required_argument, (int*)&g_config.use_cont_forget);
     args_parser.add("thread-single", required_argument, (int*)&g_config.use_thread_single);
     // initialize the benchmark context
     g_context.parse_args(argc, argv, args_parser);
@@ -254,8 +283,16 @@ int main(int argc, char *argv[]) {
         g_max_tag = 32767;
     // Setup problem
     g_context.setup(g_rank, g_nranks);
+    // Initialize the completion manager
+    switch (g_config.comp_type) {
+        case config_t::comp_type_t::REQUEST:
+            g_comp_manger_p = new detail::comp_manager_request_t;
+            break;
+        case config_t::comp_type_t::CONTINUE:
+            g_comp_manger_p = new detail::comp_manager_continue_t(g_config);
+            break;
+    }
 
-    // initialize the continuation request
     MPI_SAFECALL(MPI_Barrier(MPI_COMM_WORLD));
     auto start = std::chrono::high_resolution_clock::now();
 
