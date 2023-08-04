@@ -155,7 +155,7 @@ namespace detail {
     };
     thread_local MPI_Request comp_manager_continue_t::tls_cont_req = MPI_REQUEST_NULL;
 }
-detail::comp_manager_base_t *g_comp_manger_p;
+detail::comp_manager_base_t *g_comp_manager_p;
 
 std::vector<int> *encode_header(int tag, bench::parcel_t *parcel) {
     auto *header = new std::vector<int>;
@@ -208,7 +208,7 @@ void try_send_parcel() {
                                    parcel->peer_rank, tag, tls_context_p->comm, &request));
             requests.push_back(request);
         }
-        g_comp_manger_p->push(std::move(requests), sender_callback, parcel);
+        g_comp_manager_p->push(std::move(requests), sender_callback, parcel);
     }
 }
 
@@ -237,7 +237,7 @@ void try_receive_parcel() {
                                        status.MPI_SOURCE, tag, tls_context_p->comm, &request));
                 requests.push_back(request);
             }
-            g_comp_manger_p->push(std::move(requests), receiver_callback, parcel);
+            g_comp_manager_p->push(std::move(requests), receiver_callback, parcel);
         } else {
             receiver_callback(MPI_SUCCESS, parcel);
         }
@@ -251,12 +251,12 @@ void cancel_receive() {
 }
 
 void do_progress() {
-    g_comp_manger_p->progress();
+    g_comp_manager_p->progress();
 }
 
 void worker_thread_fn(int thread_id) {
     tls_context_p = new tls_context_t(thread_id);
-    g_comp_manger_p->init_thread();
+    g_comp_manager_p->init_thread();
     while (!g_context.is_done()) {
         try_receive_parcel();
         try_send_parcel();
@@ -264,7 +264,7 @@ void worker_thread_fn(int thread_id) {
             do_progress();
     }
     cancel_receive();
-    g_comp_manger_p->free_thread();
+    g_comp_manager_p->free_thread();
     delete tls_context_p;
 }
 
@@ -308,10 +308,10 @@ int main(int argc, char *argv[]) {
     // Initialize the completion manager
     switch (g_config.comp_type) {
         case config_t::comp_type_t::REQUEST:
-            g_comp_manger_p = new detail::comp_manager_request_t;
+            g_comp_manager_p = new detail::comp_manager_request_t;
             break;
         case config_t::comp_type_t::CONTINUE:
-            g_comp_manger_p = new detail::comp_manager_continue_t(g_config);
+            g_comp_manager_p = new detail::comp_manager_continue_t(g_config);
             break;
     }
     // Initialize streams
@@ -355,7 +355,7 @@ int main(int argc, char *argv[]) {
 ////        if (g_streams[i] != MPIX_STREAM_NULL)
 ////            MPIX_Stream_free(&g_streams[i]);
 //    }
-//    delete g_comp_manger_p;
+//    delete g_comp_manager_p;
 //    MPI_SAFECALL(MPI_Finalize());
     return 0;
 }
