@@ -6,6 +6,9 @@ find_package(MPI REQUIRED)
 add_executable(hello_world hello_world.cpp)
 target_link_libraries(hello_world PRIVATE MPI::MPI_CXX)
 
+add_executable(hello_stream hello_stream.cpp)
+target_link_libraries(hello_stream PRIVATE MPI::MPI_CXX)
+
 add_executable(basic basic.c)
 target_link_libraries(basic PRIVATE MPI::MPI_C)
 
