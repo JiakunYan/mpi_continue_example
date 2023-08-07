@@ -158,11 +158,12 @@ namespace detail {
 detail::comp_manager_base_t *g_comp_manager_p;
 
 std::vector<int> *encode_header(int tag, bench::parcel_t *parcel) {
-    auto *header = new std::vector<int>;
-    header->push_back(tag);
-    header->push_back(static_cast<int>(parcel->msgs.size()));
+    auto *header = new std::vector<int>(2 + parcel->msgs.size());
+    int i = 0;
+    (*header)[i++] = tag;
+    (*header)[i++] = static_cast<int>(parcel->msgs.size());
     for (const auto& chunk : parcel->msgs) {
-        header->push_back(static_cast<int>(chunk.size()));
+        (*header)[i++] = static_cast<int>(chunk.size());
     }
     return header;
 }
@@ -295,6 +296,11 @@ int main(int argc, char *argv[]) {
     }
     MPI_SAFECALL(MPI_Comm_size(MPI_COMM_WORLD, &g_nranks));
     MPI_SAFECALL(MPI_Comm_rank(MPI_COMM_WORLD, &g_rank));
+//    if (g_rank == 0) {
+//        bool wait_for_dbg = true;
+//        while (wait_for_dbg) continue;
+//    }
+    MPI_Barrier(MPI_COMM_WORLD);
     // get MPI max tag
     void* max_tag_p;
     int flag;
@@ -349,13 +355,13 @@ int main(int argc, char *argv[]) {
     g_context.report(total_time.count());
 
     // Finalize streams
-//    for (int i = 0; i < g_config.nvcis; ++i) {
-//        MPI_Comm_free(&g_comms[i]);
-//        /* FIXME: seems to be a bug here */
-////        if (g_streams[i] != MPIX_STREAM_NULL)
-////            MPIX_Stream_free(&g_streams[i]);
-//    }
-//    delete g_comp_manager_p;
-//    MPI_SAFECALL(MPI_Finalize());
+    for (int i = 0; i < g_config.nvcis; ++i) {
+        MPI_Comm_free(&g_comms[i]);
+        /* FIXME: seems to be a bug here */
+        if (g_streams[i] != MPIX_STREAM_NULL)
+            MPIX_Stream_free(&g_streams[i]);
+    }
+    delete g_comp_manager_p;
+    MPI_SAFECALL(MPI_Finalize());
     return 0;
 }

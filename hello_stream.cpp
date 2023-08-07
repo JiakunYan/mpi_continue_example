@@ -11,7 +11,7 @@ int main()
     MPI_Comm_rank(MPI_COMM_WORLD, &rank);
     MPI_Barrier(MPI_COMM_WORLD);
 
-    const int nstreams = 1;
+    const int nstreams = 8;
     std::vector<MPIX_Stream> streams;
     std::vector<MPI_Comm> comms;
     for (int i = 0; i < nstreams; ++i) {
