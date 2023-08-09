@@ -92,11 +92,13 @@ namespace bench {
     typedef std::vector<char> msg_t;
     struct parcel_t {
         int peer_rank;
-        std::vector<msg_t> msgs;
+        msg_t piggyback;
+        std::vector<msg_t> chunks;
         void *local_context;
         parcel_t() = default;
-        parcel_t(int peer_rank_, int nchunks, int chunk_size) : peer_rank(peer_rank_), msgs(nchunks), local_context(nullptr) {
-            for (auto &chunk: msgs) {
+        parcel_t(int peer_rank_, int piggyback_size, int nchunks, int chunk_size)
+            : peer_rank(peer_rank_), piggyback(piggyback_size), chunks(nchunks), local_context(nullptr) {
+            for (auto &chunk: chunks) {
                 chunk.resize(chunk_size);
             }
         }
@@ -106,12 +108,14 @@ namespace bench {
         void parse_args(int argc, char *argv[], args_parser_t args_parser_ = args_parser_t()) {
             args_parser = std::move(args_parser_);
             nparcels = 10000;
+            piggyback_size = 8;
             nchunks = 4;
             chunk_size = 8192;
             nthreads = 8;
             inject_rate = 0;
             is_verbose = false;
             args_parser.add("nparcels", required_argument, &nparcels);
+            args_parser.add("piggyback-size", required_argument, &piggyback_size);
             args_parser.add("nchunks", required_argument, &nchunks);
             args_parser.add("chunk-size", required_argument, &chunk_size);
             args_parser.add("nthreads", required_argument, &nthreads);
@@ -148,7 +152,7 @@ namespace bench {
                 if (recv_comp_expected == 0)
                     recv_done_flag = true;
             }
-            send_count_batch_size = send_comp_expected / nthreads / send_count_batch_percent;
+            send_count_batch_size = std::max(send_comp_expected / nthreads / send_count_batch_percent, 1);
             start_time = std::chrono::high_resolution_clock::now();
         }
 
@@ -182,7 +186,7 @@ namespace bench {
             }
             if (tls_context.send_count_reserved > 0) {
                 --tls_context.send_count_reserved;
-                parcel = new parcel_t(peer_rank, nchunks, chunk_size);
+                parcel = new parcel_t(peer_rank, piggyback_size, nchunks, chunk_size);
             }
             return parcel;
         }
@@ -224,7 +228,7 @@ namespace bench {
         }
         void report(double total_time) {
             double msg_rate = nparcels / total_time;
-            double bandwidth = msg_rate * nchunks * chunk_size;
+            double bandwidth = msg_rate * (nchunks * chunk_size + piggyback_size);
             if (rank == 0) {
                 args_parser.print(is_verbose);
                 if (is_verbose) {
@@ -256,7 +260,7 @@ namespace bench {
         }
     private:
         args_parser_t args_parser;
-        int nparcels, nchunks, chunk_size, nthreads, inject_rate, is_verbose;
+        int nparcels, piggyback_size, nchunks, chunk_size, nthreads, inject_rate, is_verbose;
         const int send_count_batch_percent = 1000;
         const int poke_count_before_flush = 1000;
         int send_count_batch_size;

@@ -28,25 +28,33 @@ int g_rank = 0, g_nranks = 1;
 bench::context_t g_context;
 int g_max_tag = 32767;
 __thread int tls_next_tag = 0;
-const int MAX_HEADER_SIZE = 1024;
+const int MAX_HEADER_SIZE = 4096;
 
 std::vector<int> *encode_header(int tag, bench::parcel_t *parcel) {
-    auto *header = new std::vector<int>(2 + parcel->msgs.size());
+    auto *header = new std::vector<int>(3 + parcel->chunks.size() +
+                                        (parcel->piggyback.size() + sizeof(int) - 1) / sizeof(int));
     int i = 0;
     (*header)[i++] = tag;
-    (*header)[i++] = static_cast<int>(parcel->msgs.size());
-    for (const auto& chunk : parcel->msgs) {
+    (*header)[i++] = static_cast<int>(parcel->piggyback.size());
+    (*header)[i++] = static_cast<int>(parcel->chunks.size());
+    for (const auto& chunk : parcel->chunks) {
         (*header)[i++] = static_cast<int>(chunk.size());
     }
+    memcpy(&(*header)[i], parcel->piggyback.data(), parcel->piggyback.size());
     return header;
 }
 
 void decode_header(const std::vector<int>& header, int *tag, bench::parcel_t *parcel) {
-    *tag = header[0];
-    parcel->msgs.resize(header[1]);
-    for (int i = 0; i < parcel->msgs.size(); ++i) {
-        parcel->msgs[i].resize(header[2 + i]);
+    int i = 0;
+    *tag = header[i++];
+    parcel->piggyback.resize(header[i++]);
+    parcel->chunks.resize(header[i++]);
+    for (auto& chunk : parcel->chunks) {
+        chunk.resize(header[i++]);
     }
+    assert(header.size() >= 3 + parcel->chunks.size() +
+                         (parcel->piggyback.size() + sizeof(int) - 1) / sizeof(int));
+    memcpy(parcel->piggyback.data(), &header[i], parcel->piggyback.size());
 }
 
 int sender_callback(int error_code, void *user_data) {

@@ -48,7 +48,7 @@ struct config_t {
 config_t g_config;
 int g_rank, g_nranks;
 bench::context_t g_context;
-const int MAX_HEADER_SIZE = 1024;
+const int MAX_HEADER_SIZE = 4096;
 __thread MPI_Request header_req = MPI_REQUEST_NULL;
 thread_local std::vector<int> recv_buffer(MAX_HEADER_SIZE);
 
@@ -65,6 +65,8 @@ __thread int tls_device_rank;
 __thread int tls_device_nranks;
 __thread int tls_header_tag;
 __thread int tls_next_tag = 0;
+__thread int pending_send = 0;
+__thread int pending_recv = 0;
 
 namespace detail {
     class comp_manager_base_t {
@@ -163,22 +165,30 @@ namespace detail {
 detail::comp_manager_base_t *g_comp_manager_p;
 
 std::vector<int> *encode_header(int tag, bench::parcel_t *parcel) {
-    auto *header = new std::vector<int>(2 + parcel->msgs.size());
+    auto *header = new std::vector<int>(3 + parcel->chunks.size() +
+            (parcel->piggyback.size() + sizeof(int) - 1) / sizeof(int));
     int i = 0;
     (*header)[i++] = tag;
-    (*header)[i++] = static_cast<int>(parcel->msgs.size());
-    for (const auto& chunk : parcel->msgs) {
+    (*header)[i++] = static_cast<int>(parcel->piggyback.size());
+    (*header)[i++] = static_cast<int>(parcel->chunks.size());
+    for (const auto& chunk : parcel->chunks) {
         (*header)[i++] = static_cast<int>(chunk.size());
     }
+    memcpy(&(*header)[i], parcel->piggyback.data(), parcel->piggyback.size());
     return header;
 }
 
 void decode_header(const std::vector<int>& header, int *tag, bench::parcel_t *parcel) {
-    *tag = header[0];
-    parcel->msgs.resize(header[1]);
-    for (int i = 0; i < parcel->msgs.size(); ++i) {
-        parcel->msgs[i].resize(header[2 + i]);
+    int i = 0;
+    *tag = header[i++];
+    parcel->piggyback.resize(header[i++]);
+    parcel->chunks.resize(header[i++]);
+    for (auto& chunk : parcel->chunks) {
+        chunk.resize(header[i++]);
     }
+    assert(header.size() >= 3 + parcel->chunks.size() +
+                            (parcel->piggyback.size() + sizeof(int) - 1) / sizeof(int));
+    memcpy(parcel->piggyback.data(), &header[i], parcel->piggyback.size());
 }
 
 int sender_callback(int error_code, void *user_data) {
@@ -186,13 +196,13 @@ int sender_callback(int error_code, void *user_data) {
     auto *header = static_cast<std::vector<int>*>(parcel->local_context);
     delete header;
     delete parcel;
-    g_context.signal_send_comp();
+    bench::context_t::signal_send_comp();
     return MPI_SUCCESS;
 }
 
 int receiver_callback(int error_code, void *user_data) {
     auto *parcel = static_cast<bench::parcel_t*>(user_data);
-    g_context.signal_recv_comp(parcel);
+    bench::context_t::signal_recv_comp(parcel);
     return MPI_SUCCESS;
 }
 
@@ -209,7 +219,7 @@ void try_send_parcel() {
         MPI_SAFECALL(MPI_Isend(header->data(), header->size(), MPI_INT,
                                parcel->peer_rank, tls_header_tag, tls_device_p->comm, &request));
         requests.push_back(request);
-        for (auto & chunk : parcel->msgs) {
+        for (auto & chunk : parcel->chunks) {
             MPI_SAFECALL(MPI_Isend(chunk.data(), chunk.size(), MPI_CHAR,
                                    parcel->peer_rank, tag, tls_device_p->comm, &request));
             requests.push_back(request);
@@ -232,9 +242,9 @@ void try_receive_parcel() {
         MPI_SAFECALL(MPI_Irecv(recv_buffer.data(), recv_buffer.size(), MPI_INT, MPI_ANY_SOURCE, tls_header_tag, tls_device_p->comm, &header_req));
         // post the follow-up receives
         parcel->peer_rank = status.MPI_SOURCE;
-        if (!parcel->msgs.empty()) {
+        if (!parcel->chunks.empty()) {
             std::vector<MPI_Request> requests;
-            for (auto &chunk: parcel->msgs) {
+            for (auto &chunk: parcel->chunks) {
                 MPI_Request request;
                 MPI_SAFECALL(MPI_Irecv(chunk.data(), chunk.size(), MPI_CHAR,
                                        status.MPI_SOURCE, tag, tls_device_p->comm, &request));
@@ -245,9 +255,6 @@ void try_receive_parcel() {
             receiver_callback(MPI_SUCCESS, parcel);
         }
     }
-}
-
-void cancel_receive() {
 }
 
 void do_progress() {
