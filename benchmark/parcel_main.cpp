@@ -174,7 +174,8 @@ std::vector<int> *encode_header(int tag, bench::parcel_t *parcel) {
     for (const auto& chunk : parcel->chunks) {
         (*header)[i++] = static_cast<int>(chunk.size());
     }
-    memcpy(&(*header)[i], parcel->piggyback.data(), parcel->piggyback.size());
+    if (parcel->piggyback.size())
+        memcpy(&(*header)[i], parcel->piggyback.data(), parcel->piggyback.size());
     return header;
 }
 
@@ -188,7 +189,8 @@ void decode_header(const std::vector<int>& header, int *tag, bench::parcel_t *pa
     }
     assert(header.size() >= 3 + parcel->chunks.size() +
                             (parcel->piggyback.size() + sizeof(int) - 1) / sizeof(int));
-    memcpy(parcel->piggyback.data(), &header[i], parcel->piggyback.size());
+    if (parcel->piggyback.size())
+        memcpy(parcel->piggyback.data(), &header[i], parcel->piggyback.size());
 }
 
 int sender_callback(int error_code, void *user_data) {
