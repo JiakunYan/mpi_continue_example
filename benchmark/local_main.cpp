@@ -27,7 +27,7 @@ config_t g_config;
 int g_rank = 0, g_nranks = 1;
 bench::context_t g_context;
 int g_max_tag = 32767;
-alignas(64) std::atomic<int> g_next_tag(0);
+__thread int tls_next_tag = 0;
 const int MAX_HEADER_SIZE = 1024;
 
 std::vector<int> *encode_header(int tag, bench::parcel_t *parcel) {
@@ -54,13 +54,13 @@ int sender_callback(int error_code, void *user_data) {
     auto *header = static_cast<std::vector<int>*>(parcel->local_context);
     delete header;
     delete parcel;
-    g_context.signal_send_comp();
+    bench::context_t::signal_send_comp();
     return 0;
 }
 
 int receiver_callback(int error_code, void *user_data) {
     auto *parcel = static_cast<bench::parcel_t*>(user_data);
-    g_context.signal_recv_comp(parcel);
+    bench::context_t::signal_recv_comp(parcel);
     return 0;
 }
 
@@ -68,7 +68,7 @@ void try_sendrecv_parcel() {
     auto *parcel = g_context.get_parcel();
     if (parcel) {
         // send the parcel
-        int tag = g_next_tag++ % (g_max_tag - 1) + 1;
+        int tag = tls_next_tag++ % (g_max_tag - 1) + 1;
         auto header = encode_header(tag, parcel);
         parcel->local_context = header;
         auto *recv_parcel = new bench::parcel_t(*parcel);

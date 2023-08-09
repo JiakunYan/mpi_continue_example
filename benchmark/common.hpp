@@ -94,6 +94,12 @@ namespace bench {
         int peer_rank;
         std::vector<msg_t> msgs;
         void *local_context;
+        parcel_t() = default;
+        parcel_t(int peer_rank_, int nchunks, int chunk_size) : peer_rank(peer_rank_), msgs(nchunks), local_context(nullptr) {
+            for (auto &chunk: msgs) {
+                chunk.resize(chunk_size);
+            }
+        }
     };
     class context_t {
     public:
@@ -103,13 +109,13 @@ namespace bench {
             nchunks = 4;
             chunk_size = 8192;
             nthreads = 8;
-            input_inject_rate = 0;
+            inject_rate = 0;
             is_verbose = false;
             args_parser.add("nparcels", required_argument, &nparcels);
             args_parser.add("nchunks", required_argument, &nchunks);
             args_parser.add("chunk-size", required_argument, &chunk_size);
             args_parser.add("nthreads", required_argument, &nthreads);
-            args_parser.add("inject-rate", required_argument, &input_inject_rate);
+            args_parser.add("inject-rate", required_argument, &inject_rate);
             args_parser.add("verbose", no_argument, &is_verbose);
             args_parser.parse_args(argc, argv);
         }
@@ -142,67 +148,78 @@ namespace bench {
                 if (recv_comp_expected == 0)
                     recv_done_flag = true;
             }
+            send_count_batch_size = send_comp_expected / nthreads / send_count_batch_percent;
             start_time = std::chrono::high_resolution_clock::now();
         }
 
         int get_nthreads() const {
             return nthreads;
         }
+        
+        bool check_inject_rate(int next_count) {
+            if (inject_rate) {
+                // Check whether we would exceed injection rate.
+                double elapsed_time = std::chrono::duration_cast<std::chrono::duration<double>>(
+                        std::chrono::high_resolution_clock::now() - start_time).count();
+                double wouldbe_inject_rate = next_count / elapsed_time;
+                if (wouldbe_inject_rate > inject_rate)
+                    return false;
+            }
+            return true;
+        }
 
         parcel_t *get_parcel() {
             parcel_t *parcel = nullptr;
-            int count = send_count;
-            if (count < send_comp_expected) {
-                if (input_inject_rate) {
-                    // Check whether we would exceed injection rate.
-                    double elapsed_time = std::chrono::duration_cast<std::chrono::duration<double>>(
-                            std::chrono::high_resolution_clock::now() - start_time).count();
-                    double wouldbe_inject_rate = (count + 1) / elapsed_time;
-                    if (wouldbe_inject_rate > input_inject_rate)
-                        return nullptr;
-                }
-                count = ++send_count;
-                if (count <= send_comp_expected) {
-                    parcel = new parcel_t;
-                    parcel->peer_rank = peer_rank;
-                    parcel->msgs.resize(nchunks);
-                    for (auto &chunk: parcel->msgs) {
-                        chunk.resize(chunk_size);
-                    }
-                    if (count == send_comp_expected) {
-                        // Calculate the actual injection rate
-                        double elapsed_time = std::chrono::duration_cast<std::chrono::duration<double>>(
-                                std::chrono::high_resolution_clock::now() - start_time).count();
-                        actual_inject_rate = send_comp_expected / elapsed_time;
+            if (tls_context.send_count_reserved == 0) {
+                int count = send_count;
+                int next_batch = std::min(send_comp_expected - count, send_count_batch_size);
+                if (count < send_comp_expected && check_inject_rate(count + next_batch)) {
+                    count = send_count.fetch_add(next_batch, std::memory_order_relaxed);
+                    if (count < send_comp_expected) {
+                        tls_context.send_count_reserved = std::min(next_batch, send_comp_expected - count);
                     }
                 }
+            }
+            if (tls_context.send_count_reserved > 0) {
+                --tls_context.send_count_reserved;
+                parcel = new parcel_t(peer_rank, nchunks, chunk_size);
             }
             return parcel;
         }
-        bool signal_send_comp() {
-            int count = ++send_comp_count;
-            if (count == send_comp_expected) {
-                if (!send_done_flag)
-                    send_done_flag = true;
-                return true;
-            } else {
-                assert(count < send_comp_expected);
-                return false;
-            }
+        static void signal_send_comp() {
+            ++tls_context.send_comp_count;
         }
-        bool signal_recv_comp(parcel_t *parcel) {
+        static void signal_recv_comp(parcel_t *parcel) {
             delete parcel;
-            int count = ++recv_comp_count;
-            if (count == recv_comp_expected) {
-                if (!recv_done_flag)
-                    recv_done_flag = true;
-                return true;
-            } else {
-                assert(count < recv_comp_expected);
-                return false;
-            }
+            ++tls_context.recv_comp_count;
         }
         bool is_done() {
+            if (tls_context.send_comp_count == tls_context.last_send_comp_count &&
+                tls_context.recv_comp_count == tls_context.last_recv_comp_count) {
+                if (++tls_context.poke_count == poke_count_before_flush) {
+                    if (tls_context.send_comp_count > 0) {
+                        int new_count = send_comp_count.fetch_add(tls_context.send_comp_count) + tls_context.send_comp_count;
+                        if (new_count == send_comp_expected) {
+                            send_done_flag = true;
+                        }
+                        tls_context.send_comp_count = 0;
+                    }
+                    if (tls_context.recv_comp_count > 0) {
+                        int new_count = recv_comp_count.fetch_add(tls_context.recv_comp_count) + tls_context.recv_comp_count;
+                        if (new_count == recv_comp_expected) {
+                            recv_done_flag = true;
+                        }
+                        tls_context.recv_comp_count = 0;
+                    }
+                    tls_context.poke_count = 0;
+                    tls_context.last_send_comp_count = 0;
+                    tls_context.last_recv_comp_count = 0;
+                }
+            } else {
+                tls_context.poke_count = 0;
+                tls_context.last_send_comp_count = tls_context.send_comp_count;
+                tls_context.last_recv_comp_count = tls_context.recv_comp_count;
+            }
             return send_done_flag && recv_done_flag;
         }
         void report(double total_time) {
@@ -217,8 +234,7 @@ namespace bench {
                             << "chunk_size (B): " << chunk_size << "\n"
                             << "nthreads: " << nthreads << "\n"
                             << "nranks: " << nranks << "\n"
-                            << "Input Injection Rate (K/s): " << input_inject_rate / 1e3 << "\n"
-                            << "Actual Injection Rate (K/s): " << actual_inject_rate / 1e3 << "\n"
+                            << "Injection Rate (K/s): " << inject_rate / 1e3 << "\n"
                             << "Total time (s): " << total_time << "\n"
                             << "Message Rate (K/s): " << msg_rate / 1e3 << "\n"
                             << "Bandwidth (MB/s): " << bandwidth / 1e6
@@ -230,8 +246,7 @@ namespace bench {
                             << "\"chunk_size (B)\": " << chunk_size << ", "
                             << "\"nthreads\": " << nthreads << ", "
                             << "\"nranks\": " << nranks << ", "
-                            << "\"Input Injection Rate (K/s)\": " << input_inject_rate / 1e3 << ", "
-                            << "\"Actual Injection Rate (K/s)\": " << actual_inject_rate / 1e3 << ", "
+                            << "\"Injection Rate (K/s)\": " << inject_rate / 1e3 << ", "
                             << "\"Total time (s)\": " << total_time << ", "
                             << "\"Message Rate (K/s)\": " << msg_rate / 1e3 << ", "
                             << "\"Bandwidth (MB/s)\": " << bandwidth / 1e6 << " }"
@@ -241,17 +256,29 @@ namespace bench {
         }
     private:
         args_parser_t args_parser;
-        int nparcels, nchunks, chunk_size, nthreads, input_inject_rate, is_verbose;
+        int nparcels, nchunks, chunk_size, nthreads, inject_rate, is_verbose;
+        const int send_count_batch_percent = 1000;
+        const int poke_count_before_flush = 1000;
+        int send_count_batch_size;
         std::chrono::high_resolution_clock::time_point start_time;
         int rank, nranks;
         int send_comp_expected, recv_comp_expected, peer_rank;
-        double actual_inject_rate;
         alignas(64) std::atomic<int> send_count;
         alignas(64) std::atomic<int> send_comp_count;
         alignas(64) std::atomic<int> recv_comp_count;
         alignas(64) std::atomic<bool> send_done_flag;
         alignas(64) std::atomic<bool> recv_done_flag;
+        struct tls_context_t {
+            int send_count_reserved = 0;
+            int send_comp_count = 0;
+            int recv_comp_count = 0;
+            int poke_count = 0;
+            int last_send_comp_count = 0;
+            int last_recv_comp_count = 0;
+        };
+        static __thread tls_context_t tls_context;
     };
+    __thread context_t::tls_context_t context_t::tls_context;
 } // namespace bench
 
 #endif //MPI_CONTINUE_EXAMPLE_COMMON_HPP

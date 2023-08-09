@@ -48,24 +48,23 @@ struct config_t {
 config_t g_config;
 int g_rank, g_nranks;
 bench::context_t g_context;
-std::vector<MPIX_Stream> g_streams;
-std::vector<MPI_Comm> g_comms;
-int g_max_tag;
-alignas(64) std::atomic<int> g_next_tag(0);
 const int MAX_HEADER_SIZE = 1024;
-struct tls_context_t {
+__thread MPI_Request header_req = MPI_REQUEST_NULL;
+thread_local std::vector<int> recv_buffer(MAX_HEADER_SIZE);
+
+struct alignas(64) device_t {
     MPIX_Stream stream;
     MPI_Comm comm;
-    MPI_Request header_req;
-    std::vector<int> recv_buffer;
-    explicit tls_context_t(int thread_id) : recv_buffer(MAX_HEADER_SIZE), header_req(MPI_REQUEST_NULL) {
-        int nthreads_per_vci = (g_config.nthreads + g_config.nvcis - 1) / g_config.nvcis;
-        int vci_id = thread_id / nthreads_per_vci;
-        stream = g_streams[vci_id];
-        comm = g_comms[vci_id];
-    }
+    int max_tag;
+    device_t() : stream(MPIX_STREAM_NULL), max_tag(32767) {};
 };
-thread_local tls_context_t *tls_context_p;
+std::vector<device_t> g_devices;
+__thread device_t *tls_device_p;;
+__thread int tls_device_id;
+__thread int tls_device_rank;
+__thread int tls_device_nranks;
+__thread int tls_header_tag;
+__thread int tls_next_tag = 0;
 
 namespace detail {
     class comp_manager_base_t {
@@ -85,11 +84,17 @@ namespace detail {
             void *context;
         };
         void push(std::vector<MPI_Request>&& requests, cb_fn_t *cb, void *context) override {
-            auto *parcel = new pending_parcel_t;
-            parcel->requests = std::move(requests);
-            parcel->cb = cb;
-            parcel->context = context;
-            pending_parcels.push_back(parcel);
+            int flag;
+            MPI_SAFECALL(MPI_Testall(requests.size(), requests.data(), &flag, MPI_STATUS_IGNORE));
+            if (flag) {
+                cb(MPI_SUCCESS, context);
+            } else {
+                auto *parcel = new pending_parcel_t;
+                parcel->requests = std::move(requests);
+                parcel->cb = cb;
+                parcel->context = context;
+                pending_parcels.push_back(parcel);
+            }
         }
         bool progress() override {
             if (pending_parcels.empty())
@@ -124,8 +129,8 @@ namespace detail {
                                           context, cont_flag, MPI_STATUSES_IGNORE, tls_cont_req));
         }
         bool progress() override {
-            if (tls_context_p->stream != MPIX_STREAM_NULL)
-                MPI_SAFECALL(MPIX_Stream_progress(tls_context_p->stream));
+            if (tls_device_p->stream != MPIX_STREAM_NULL)
+                MPI_SAFECALL(MPIX_Stream_progress(tls_device_p->stream));
             if (config.use_cont_forget) {
 //                MPI_SAFECALL(MPIX_Stream_progress(MPIX_STREAM_NULL));
             } else {
@@ -195,18 +200,18 @@ void try_send_parcel() {
     auto *parcel = g_context.get_parcel();
     if (parcel) {
         // send the parcel
-        int tag = g_next_tag++ % (g_max_tag - 1) + 1;
+        // get the tag
+        int tag = (tls_next_tag++ * tls_device_nranks + tls_device_rank) % (tls_device_p->max_tag - 1) + tls_device_nranks;
         auto header = encode_header(tag, parcel);
         parcel->local_context = header;
         std::vector<MPI_Request> requests;
         MPI_Request request;
-        // header messages always use tag 0.
         MPI_SAFECALL(MPI_Isend(header->data(), header->size(), MPI_INT,
-                               parcel->peer_rank, 0, tls_context_p->comm, &request));
+                               parcel->peer_rank, tls_header_tag, tls_device_p->comm, &request));
         requests.push_back(request);
         for (auto & chunk : parcel->msgs) {
             MPI_SAFECALL(MPI_Isend(chunk.data(), chunk.size(), MPI_CHAR,
-                                   parcel->peer_rank, tag, tls_context_p->comm, &request));
+                                   parcel->peer_rank, tag, tls_device_p->comm, &request));
             requests.push_back(request);
         }
         g_comp_manager_p->push(std::move(requests), sender_callback, parcel);
@@ -214,20 +219,17 @@ void try_send_parcel() {
 }
 
 void try_receive_parcel() {
-    if (tls_context_p->header_req == MPI_REQUEST_NULL)
-        MPI_SAFECALL(MPI_Irecv(tls_context_p->recv_buffer.data(), tls_context_p->recv_buffer.size(), MPI_INT, MPI_ANY_SOURCE, 0, tls_context_p->comm, &tls_context_p->header_req));
-
     MPI_Status status;
     int flag = 0;
-    MPI_SAFECALL(MPI_Test(&tls_context_p->header_req, &flag, &status));
+    MPI_SAFECALL(MPI_Test(&header_req, &flag, &status));
     if (flag) {
         // got a new header message
         int tag;
         auto *parcel = new bench::parcel_t;
-        decode_header(tls_context_p->recv_buffer, &tag, parcel);
+        decode_header(recv_buffer, &tag, parcel);
         assert(tag > 0);
         // post a new receive for header
-        MPI_SAFECALL(MPI_Irecv(tls_context_p->recv_buffer.data(), tls_context_p->recv_buffer.size(), MPI_INT, MPI_ANY_SOURCE, 0, tls_context_p->comm, &tls_context_p->header_req));
+        MPI_SAFECALL(MPI_Irecv(recv_buffer.data(), recv_buffer.size(), MPI_INT, MPI_ANY_SOURCE, tls_header_tag, tls_device_p->comm, &header_req));
         // post the follow-up receives
         parcel->peer_rank = status.MPI_SOURCE;
         if (!parcel->msgs.empty()) {
@@ -235,7 +237,7 @@ void try_receive_parcel() {
             for (auto &chunk: parcel->msgs) {
                 MPI_Request request;
                 MPI_SAFECALL(MPI_Irecv(chunk.data(), chunk.size(), MPI_CHAR,
-                                       status.MPI_SOURCE, tag, tls_context_p->comm, &request));
+                                       status.MPI_SOURCE, tag, tls_device_p->comm, &request));
                 requests.push_back(request);
             }
             g_comp_manager_p->push(std::move(requests), receiver_callback, parcel);
@@ -246,9 +248,6 @@ void try_receive_parcel() {
 }
 
 void cancel_receive() {
-    if (tls_context_p->header_req != MPI_REQUEST_NULL) {
-        MPI_Cancel(&tls_context_p->header_req);
-    }
 }
 
 void do_progress() {
@@ -256,17 +255,24 @@ void do_progress() {
 }
 
 void worker_thread_fn(int thread_id) {
-    tls_context_p = new tls_context_t(thread_id);
+    int nthreads_per_device = (g_config.nthreads + g_config.nvcis - 1) / g_config.nvcis;
+    tls_device_id = thread_id / nthreads_per_device;
+    tls_device_rank = thread_id - tls_device_id * nthreads_per_device;
+    tls_device_nranks = nthreads_per_device;
+    tls_device_p = &g_devices[tls_device_id];
     g_comp_manager_p->init_thread();
+    tls_header_tag = 0;
+    MPI_SAFECALL(MPI_Irecv(recv_buffer.data(), recv_buffer.size(), MPI_INT, MPI_ANY_SOURCE, tls_header_tag, tls_device_p->comm, &header_req));
     while (!g_context.is_done()) {
         try_receive_parcel();
         try_send_parcel();
         if (g_config.progress_type == config_t::progress_type_t::SHARED)
             do_progress();
     }
-    cancel_receive();
+    if (header_req != MPI_REQUEST_NULL) {
+        MPI_Cancel(&header_req);
+    }
     g_comp_manager_p->free_thread();
-    delete tls_context_p;
 }
 
 int main(int argc, char *argv[]) {
@@ -286,6 +292,12 @@ int main(int argc, char *argv[]) {
     // initialize the benchmark context
     g_context.parse_args(argc, argv, args_parser);
     g_config.nthreads = g_context.get_nthreads();
+    assert(!g_config.enable_stream || g_config.nthreads == g_config.nvcis);
+    if (g_config.enable_stream) {
+        setenv("MPIR_CVAR_CH4_RESERVE_VCIS", std::to_string(g_config.nvcis).c_str(), true);
+    } else {
+        setenv("MPIR_CVAR_CH4_NUM_VCIS", std::to_string(g_config.nvcis).c_str(), true);
+    }
     // initialize MPI
     if (g_config.nthreads == 1 && g_config.use_thread_single) {
         MPI_SAFECALL(MPI_Init(nullptr, nullptr));
@@ -301,14 +313,6 @@ int main(int argc, char *argv[]) {
 //        while (wait_for_dbg) continue;
 //    }
     MPI_Barrier(MPI_COMM_WORLD);
-    // get MPI max tag
-    void* max_tag_p;
-    int flag;
-    MPI_SAFECALL(MPI_Comm_get_attr(MPI_COMM_WORLD, MPI_TAG_UB, &max_tag_p, &flag));
-    if (flag)
-        g_max_tag = *(int*) max_tag_p;
-    else
-        g_max_tag = 32767;
     // Setup problem
     g_context.setup(g_rank, g_nranks);
     // Initialize the completion manager
@@ -320,19 +324,23 @@ int main(int argc, char *argv[]) {
             g_comp_manager_p = new detail::comp_manager_continue_t(g_config);
             break;
     }
-    // Initialize streams
+    // Initialize devices
     for (int i = 0; i < g_config.nvcis; ++i) {
-        MPI_Comm comm;
+        device_t device;
         if (g_config.enable_stream) {
-            MPIX_Stream stream;
-            MPIX_Stream_create(MPI_INFO_NULL, &stream);
-            g_streams.push_back(stream);
-            MPIX_Stream_comm_create(MPI_COMM_WORLD, stream, &comm);
+            MPIX_Stream_create(MPI_INFO_NULL, &device.stream);
+            MPIX_Stream_comm_create(MPI_COMM_WORLD, device.stream, &device.comm);
         } else {
-            g_streams.push_back(MPIX_STREAM_NULL);
-            MPI_Comm_dup(MPI_COMM_WORLD, &comm);
+            device.stream = MPIX_STREAM_NULL;
+            MPI_Comm_dup(MPI_COMM_WORLD, &device.comm);
         }
-        g_comms.push_back(comm);
+        // get MPI max tag
+        void* max_tag_p;
+        int flag;
+        MPI_SAFECALL(MPI_Comm_get_attr(device.comm, MPI_TAG_UB, &max_tag_p, &flag));
+        if (flag)
+            device.max_tag = *(int*) max_tag_p;
+        g_devices.push_back(device);
     }
 
     MPI_SAFECALL(MPI_Barrier(MPI_COMM_WORLD));
@@ -355,11 +363,10 @@ int main(int argc, char *argv[]) {
     g_context.report(total_time.count());
 
     // Finalize streams
-    for (int i = 0; i < g_config.nvcis; ++i) {
-        MPI_Comm_free(&g_comms[i]);
-        /* FIXME: seems to be a bug here */
-        if (g_streams[i] != MPIX_STREAM_NULL)
-            MPIX_Stream_free(&g_streams[i]);
+    for (auto & device : g_devices) {
+        MPI_Comm_free(&device.comm);
+        if (device.stream != MPIX_STREAM_NULL)
+            MPIX_Stream_free(&device.stream);
     }
     delete g_comp_manager_p;
     MPI_SAFECALL(MPI_Finalize());
