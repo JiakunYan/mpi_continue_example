@@ -131,8 +131,6 @@ namespace detail {
                                           context, cont_flag, MPI_STATUSES_IGNORE, tls_cont_req));
         }
         bool progress() override {
-            if (tls_device_p->stream != MPIX_STREAM_NULL)
-                MPI_SAFECALL(MPIX_Stream_progress(tls_device_p->stream));
             if (config.use_cont_forget) {
 //                MPI_SAFECALL(MPIX_Stream_progress(MPIX_STREAM_NULL));
             } else {
@@ -260,6 +258,8 @@ void try_receive_parcel() {
 }
 
 void do_progress() {
+    if (tls_device_p->stream != MPIX_STREAM_NULL)
+        MPI_SAFECALL(MPIX_Stream_progress(tls_device_p->stream));
     g_comp_manager_p->progress();
 }
 
