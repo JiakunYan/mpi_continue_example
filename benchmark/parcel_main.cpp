@@ -42,6 +42,7 @@ struct config_t {
     int use_cont_forget = true;
     int use_thread_single = true;
     int enable_stream = false;
+    int nsteps = 0;
     int nvcis = 1;
 };
 
@@ -125,7 +126,7 @@ namespace detail {
             int cont_flag = 0;
             if (config.use_cont_imm)
                 cont_flag |= MPIX_CONT_IMMEDIATE;
-            if (config.use_thread_single)
+            if (config.use_cont_forget)
                 cont_flag |= MPIX_CONT_FORGET;
             MPI_SAFECALL(MPIX_Continueall(static_cast<int>(requests.size()), requests.data(), cb,
                                           context, cont_flag, MPI_STATUSES_IGNORE, tls_cont_req));
@@ -195,36 +196,51 @@ int sender_callback(int error_code, void *user_data) {
     auto *parcel = static_cast<bench::parcel_t*>(user_data);
     auto *header = static_cast<std::vector<int>*>(parcel->local_context);
     delete header;
-    delete parcel;
-    bench::context_t::signal_send_comp();
+    int step = *(int*) parcel->piggyback.data();
+    if (step == 0) {
+        delete parcel;
+        bench::context_t::signal_send_comp();
+    }
     return MPI_SUCCESS;
+}
+
+void send_parcel(bench::parcel_t *parcel) {
+    // get the tag
+    int tag = (tls_next_tag++ * tls_device_nranks + tls_device_rank) % (tls_device_p->max_tag - 1) + tls_device_nranks;
+    auto header = encode_header(tag, parcel);
+    parcel->local_context = header;
+    std::vector<MPI_Request> requests;
+    MPI_Request request;
+    MPI_SAFECALL(MPI_Isend(header->data(), header->size(), MPI_INT,
+                           parcel->peer_rank, tls_header_tag, tls_device_p->comm, &request));
+    requests.push_back(request);
+    for (auto & chunk : parcel->chunks) {
+        MPI_SAFECALL(MPI_Isend(chunk.data(), chunk.size(), MPI_CHAR,
+                               parcel->peer_rank, tag, tls_device_p->comm, &request));
+        requests.push_back(request);
+    }
+    g_comp_manager_p->push(std::move(requests), sender_callback, parcel);
 }
 
 int receiver_callback(int error_code, void *user_data) {
     auto *parcel = static_cast<bench::parcel_t*>(user_data);
-    bench::context_t::signal_recv_comp(parcel);
+    int step = *(int*) parcel->piggyback.data();
+    if (step == 0) {
+        bench::context_t::signal_recv_comp(parcel);
+    } else {
+        --step;
+        *(int*) parcel->piggyback.data() = step;
+        send_parcel(parcel);
+    }
     return MPI_SUCCESS;
 }
 
 void try_send_parcel() {
     auto *parcel = g_context.get_parcel();
     if (parcel) {
-        // send the parcel
-        // get the tag
-        int tag = (tls_next_tag++ * tls_device_nranks + tls_device_rank) % (tls_device_p->max_tag - 1) + tls_device_nranks;
-        auto header = encode_header(tag, parcel);
-        parcel->local_context = header;
-        std::vector<MPI_Request> requests;
-        MPI_Request request;
-        MPI_SAFECALL(MPI_Isend(header->data(), header->size(), MPI_INT,
-                               parcel->peer_rank, tls_header_tag, tls_device_p->comm, &request));
-        requests.push_back(request);
-        for (auto & chunk : parcel->chunks) {
-            MPI_SAFECALL(MPI_Isend(chunk.data(), chunk.size(), MPI_CHAR,
-                                   parcel->peer_rank, tag, tls_device_p->comm, &request));
-            requests.push_back(request);
-        }
-        g_comp_manager_p->push(std::move(requests), sender_callback, parcel);
+        assert(parcel->piggyback.size() > sizeof(int));
+        *(int*) parcel->piggyback.data() = g_config.nsteps - 1;
+        send_parcel(parcel);
     }
 }
 
@@ -301,6 +317,7 @@ int main(int argc, char *argv[]) {
     // initialize the benchmark context
     g_context.parse_args(argc, argv, args_parser);
     g_config.nthreads = g_context.get_nthreads();
+    g_config.nsteps = g_context.get_nsteps();
     assert(!g_config.enable_stream || g_config.nthreads == g_config.nvcis);
     if (g_config.enable_stream) {
         setenv("MPIR_CVAR_CH4_RESERVE_VCIS", std::to_string(g_config.nvcis).c_str(), true);

@@ -5,6 +5,11 @@
 #include <cstring>
 #include <utility>
 #include <chrono>
+#include <vector>
+#include <string>
+#include <iostream>
+#include <atomic>
+#include <cassert>
 
 namespace bench {
     class args_parser_t {
@@ -113,6 +118,7 @@ namespace bench {
             chunk_size = 8192;
             nthreads = 8;
             inject_rate = 0;
+            nsteps = 1;
             is_verbose = false;
             args_parser.add("nparcels", required_argument, &nparcels);
             args_parser.add("piggyback-size", required_argument, &piggyback_size);
@@ -120,6 +126,7 @@ namespace bench {
             args_parser.add("chunk-size", required_argument, &chunk_size);
             args_parser.add("nthreads", required_argument, &nthreads);
             args_parser.add("inject-rate", required_argument, &inject_rate);
+            args_parser.add("nsteps", required_argument, &nsteps);
             args_parser.add("verbose", no_argument, &is_verbose);
             args_parser.parse_args(argc, argv);
         }
@@ -133,31 +140,39 @@ namespace bench {
             recv_done_flag = false;
             assert(nranks == 1 || nranks % 2 == 0);
             if (nranks == 1) {
+                send_count_expected = nparcels;
                 send_comp_expected = nparcels;
                 recv_comp_expected = nparcels;
                 peer_rank = 0;
             } else {
                 peer_rank = (1 - rank % 2) + rank / 2 * 2;
                 if (rank % 2 == 0) {
-                    // the sender
-                    send_comp_expected = nparcels;
-                    recv_comp_expected = 0;
+                    send_count_expected = nparcels;
                 } else {
-                    // the receiver
+                    send_count_expected = 0;
+                }
+                if ((rank + nsteps) % 2 == 0) {
                     send_comp_expected = 0;
                     recv_comp_expected = nparcels;
+                } else {
+                    send_comp_expected = nparcels;
+                    recv_comp_expected = 0;
                 }
                 if (send_comp_expected == 0)
                     send_done_flag = true;
                 if (recv_comp_expected == 0)
                     recv_done_flag = true;
             }
-            send_count_batch_size = std::max(send_comp_expected / nthreads / send_count_batch_percent, 1);
+            send_count_batch_size = std::max(send_count_expected / nthreads / send_count_batch_percent, 1);
             start_time = std::chrono::high_resolution_clock::now();
         }
 
         int get_nthreads() const {
             return nthreads;
+        }
+
+        int get_nsteps() const {
+            return nsteps;
         }
         
         bool check_inject_rate(int next_count) {
@@ -176,11 +191,11 @@ namespace bench {
             parcel_t *parcel = nullptr;
             if (tls_context.send_count_reserved == 0) {
                 int count = send_count;
-                int next_batch = std::min(send_comp_expected - count, send_count_batch_size);
-                if (count < send_comp_expected && check_inject_rate(count + next_batch)) {
+                int next_batch = std::min(send_count_expected - count, send_count_batch_size);
+                if (count < send_count_expected && check_inject_rate(count + next_batch)) {
                     count = send_count.fetch_add(next_batch, std::memory_order_relaxed);
-                    if (count < send_comp_expected) {
-                        tls_context.send_count_reserved = std::min(next_batch, send_comp_expected - count);
+                    if (count < send_count_expected) {
+                        tls_context.send_count_reserved = std::min(next_batch, send_count_expected - count);
                     }
                 }
             }
@@ -240,6 +255,7 @@ namespace bench {
                             << "nranks: " << nranks << "\n"
                             << "Injection Rate (K/s): " << inject_rate / 1e3 << "\n"
                             << "Total time (s): " << total_time << "\n"
+                            << "Latency (us): " << total_time * 1e6 / nsteps << "\n"
                             << "Message Rate (K/s): " << msg_rate / 1e3 << "\n"
                             << "Bandwidth (MB/s): " << bandwidth / 1e6
                             << std::endl;
@@ -252,6 +268,7 @@ namespace bench {
                             << "\"nranks\": " << nranks << ", "
                             << "\"Injection Rate (K/s)\": " << inject_rate / 1e3 << ", "
                             << "\"Total time (s)\": " << total_time << ", "
+                            << "\"Latency (us)\": " << total_time * 1e6 / nsteps << ", "
                             << "\"Message Rate (K/s)\": " << msg_rate / 1e3 << ", "
                             << "\"Bandwidth (MB/s)\": " << bandwidth / 1e6 << " }"
                             << std::endl;
@@ -260,13 +277,13 @@ namespace bench {
         }
     private:
         args_parser_t args_parser;
-        int nparcels, piggyback_size, nchunks, chunk_size, nthreads, inject_rate, is_verbose;
+        int nparcels, piggyback_size, nchunks, chunk_size, nthreads, inject_rate, is_verbose, nsteps;
         const int send_count_batch_percent = 1000;
         const int poke_count_before_flush = 1000;
         int send_count_batch_size;
         std::chrono::high_resolution_clock::time_point start_time;
         int rank, nranks;
-        int send_comp_expected, recv_comp_expected, peer_rank;
+        int send_count_expected, send_comp_expected, recv_comp_expected, peer_rank;
         alignas(64) std::atomic<int> send_count;
         alignas(64) std::atomic<int> send_comp_count;
         alignas(64) std::atomic<int> recv_comp_count;
