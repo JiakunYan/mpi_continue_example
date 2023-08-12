@@ -25,6 +25,7 @@ namespace bench {
         }
 
         void parse_args(int argc, char *argv[]) {
+            exe_name = argv[0];
             int long_flag;
             std::vector<struct option> long_options;
             long_options.reserve(args.size() + 1);
@@ -58,26 +59,30 @@ namespace bench {
 
         void print(bool verbose) {
             if (!verbose) {
-                std::cout << "ArgsParser: {";
+                std::cout << R"(ArgsParser: { "exe": ")" << exe_name.c_str() << "\", ";
             }
             for (auto& arg : args) {
-                if (verbose) {
-                    std::string verbose_val;
-                    if (!arg.dict.empty()) {
-                        for (auto &item : arg.dict) {
-                            if (item.val == *arg.ptr) {
-                                verbose_val = item.key;
-                                break;
-                            }
+                std::string verbose_val;
+                if (!arg.dict.empty()) {
+                    for (auto &item : arg.dict) {
+                        if (item.val == *arg.ptr) {
+                            verbose_val = item.key;
+                            break;
                         }
                     }
+                }
+                if (verbose) {
                     std::cout << "ArgsParser: " << arg.name << " = " << *arg.ptr;
                     if (!verbose_val.empty()) {
                         std::cout << "(" << verbose_val << ")";
                     }
                     std::cout << std::endl;
                 } else {
-                    std::cout << "\"" << arg.name << "\": " << *arg.ptr << ", ";
+                    if (!verbose_val.empty()) {
+                        std::cout << "\"" << arg.name << "\": \"" << verbose_val << "\", ";
+                    } else {
+                        std::cout << "\"" << arg.name << "\": " << *arg.ptr << ", ";
+                    }
                 }
             }
             if (!verbose) {
@@ -92,6 +97,7 @@ namespace bench {
             std::vector<dict_entry_t> dict;
         };
         std::vector<arg_t> args;
+        std::string exe_name;
     };
 
     typedef std::vector<char> msg_t;

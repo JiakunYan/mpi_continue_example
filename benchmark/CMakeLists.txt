@@ -12,3 +12,9 @@ target_link_libraries(microbenchmark1 PRIVATE MPI::MPI_CXX)
 
 add_executable(microbenchmark2 microbenchmark2.cpp)
 target_link_libraries(microbenchmark2 PRIVATE MPI::MPI_CXX)
+
+add_executable(microbenchmark3 microbenchmark3.cpp)
+target_link_libraries(microbenchmark3 PRIVATE MPI::MPI_CXX)
+
+add_executable(microbenchmark4 microbenchmark4.cpp)
+target_link_libraries(microbenchmark4 PRIVATE MPI::MPI_CXX)

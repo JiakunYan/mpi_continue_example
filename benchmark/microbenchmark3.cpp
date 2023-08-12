@@ -9,13 +9,11 @@ struct config_t {
         REQUEST,
         CONTINUE,
     } comp_type = comp_type_t::CONTINUE;
-    int nmsgs = 10000;
+    int nmsgs = 100;
+    int niters = 100;
     int msg_size = 8;
-    enum class order_t {
-        SAME,
-        REVERSE,
-    };
-    order_t order;
+    int use_diff_tag = true;
+    int use_diff_order = false;
 };
 config_t g_config;
 detail::comp_manager_base_t *g_comp_manager_p;
@@ -29,40 +27,56 @@ int receiver_callback(int error_code, void *user_data) {
     return MPI_SUCCESS;
 }
 
-void worker_fn(int thread_id) {
-    char buffer[1];
-    if (g_rank == 0) {
-        // pre-post recvs
+void send_fn() {
+    char signal[1];
+    std::vector<char> buffer(g_config.msg_size);
+    MPI_Barrier(MPI_COMM_WORLD);
+    auto start = std::chrono::high_resolution_clock::now();
+    for (int i = 0; i < g_config.niters; ++i) {
+        for (int j = 0; j < g_config.nmsgs; ++j) {
+            int tag = 0;
+            if (g_config.use_diff_tag) {
+                tag = j;
+            }
+            MPI_SAFECALL(MPI_Send(buffer.data(), buffer.size(), MPI_BYTE, 1 - g_rank, tag, comm));
+        }
+        MPI_Recv(signal, 1, MPI_BYTE, 1 - g_rank, 0, comm, MPI_STATUS_IGNORE);
+    }
+    MPI_Barrier(MPI_COMM_WORLD);
+    auto end = std::chrono::high_resolution_clock::now();
+    auto total_time = std::chrono::duration_cast<std::chrono::duration<double>>(end - start).count();
+    std::cout << "Result: {"
+              << "\"Average time per request (us)\": " << total_time * 1e6 / g_config.niters / g_config.nmsgs << ", "
+              << "\"Average time per iter (us)\": " << total_time * 1e6 / g_config.niters << ", "
+              << "\"Total time (s)\": " << total_time << " }"
+              << std::endl;
+}
+
+void recv_fn() {
+    char signal[1];
+    std::vector<char> recv_buf(g_config.msg_size);
+    MPI_Barrier(MPI_COMM_WORLD);
+    for (int i = 0; i < g_config.niters; ++i) {
         int counter = g_config.nmsgs;
-        std::vector<char> recv_buf(g_config.msg_size);
-        for (int i = 0; i < g_config.nmsgs; ++i) {
+        for (int j = 0; j < g_config.nmsgs; ++j) {
             std::vector<MPI_Request> requests(1);
-            MPI_SAFECALL(MPI_Irecv(recv_buf.data(), recv_buf.size(), MPI_BYTE, 1 - g_rank, i, comm, &requests[0]));
-            assert(requests[0] != MPI_REQUEST_NULL);
+            int tag = 0;
+            if (g_config.use_diff_tag) {
+                tag = j;
+                if (g_config.use_diff_order) {
+                    tag = g_config.nmsgs - j - 1;
+                }
+            }
+            MPI_SAFECALL(MPI_Irecv(recv_buf.data(), recv_buf.size(), MPI_BYTE, 1 - g_rank, tag, comm, &requests[0]));
             g_comp_manager_p->push(std::move(requests), receiver_callback, &counter);
         }
-        MPI_Send(buffer, 1, MPI_BYTE, 1 - g_rank, 0, comm);
-        auto start = std::chrono::high_resolution_clock::now();
         while (counter) {
             MPIX_Stream_progress(stream);
             g_comp_manager_p->progress();
         }
-        auto end = std::chrono::high_resolution_clock::now();
-        auto total_time = std::chrono::duration_cast<std::chrono::duration<double>>(end - start).count();
-        std::cout << "Result: {"
-                  << "\"Average time per request (us)\": " << total_time * 1e6 / g_config.nmsgs << ", "
-                  << "\"Total time (s)\": " << total_time << " }"
-                  << std::endl;
-    } else {
-        std::vector<MPI_Request> requests(g_config.nmsgs);
-        std::vector<char> send_buf(g_config.msg_size);
-        MPI_Recv(buffer, 1, MPI_BYTE, 1 - g_rank, 0, comm, MPI_STATUS_IGNORE);
-        for (int i = g_config.nmsgs - 1; i >= 0; --i) {
-            MPI_SAFECALL(MPI_Isend(send_buf.data(), send_buf.size(), MPI_BYTE, 1 - g_rank, i, comm, &requests[i]));
-        }
-        MPI_Waitall(requests.size(), requests.data(), MPI_STATUSES_IGNORE);
+        MPI_Send(signal, 1, MPI_BYTE, 1 - g_rank, 0, comm);
     }
-    MPI_Barrier(comm);
+    MPI_Barrier(MPI_COMM_WORLD);
 }
 
 int main(int argc, char *argv[]) {
@@ -70,13 +84,13 @@ int main(int argc, char *argv[]) {
 //    while (wait_for_dbg) continue;
     bench::args_parser_t args_parser;
     args_parser.add("nmsgs", required_argument, (int*)&g_config.nmsgs);
+    args_parser.add("niters", required_argument, (int*)&g_config.niters);
     args_parser.add("msg-size", required_argument, (int*)&g_config.msg_size);
-    args_parser.add("order", required_argument, (int*)&g_config.order,
-                    {{"same", (int)config_t::order_t::SAME},
-                     {"reverse", (int)config_t::order_t::REVERSE},});
     args_parser.add("comp-type", required_argument, (int*)&g_config.comp_type,
                     {{"continue", (int)config_t::comp_type_t::CONTINUE},
                      {"request", (int)config_t::comp_type_t::REQUEST},});
+    args_parser.add("use-diff-tag", required_argument, (int*)&g_config.use_diff_tag);
+    args_parser.add("use-diff-order", required_argument, (int*)&g_config.use_diff_order);
     args_parser.parse_args(argc, argv);
     // initialize MPI
     setenv("MPIR_CVAR_CH4_RESERVE_VCIS", "1", true);
@@ -103,7 +117,11 @@ int main(int argc, char *argv[]) {
     MPIX_Stream_comm_create(MPI_COMM_WORLD, stream, &comm);
 
     g_comp_manager_p->init_thread();
-    worker_fn(0);
+    if (g_rank == 0) {
+        send_fn();
+    } else {
+        recv_fn();
+    }
     g_comp_manager_p->free_thread();
 
     MPI_SAFECALL(MPI_Finalize());

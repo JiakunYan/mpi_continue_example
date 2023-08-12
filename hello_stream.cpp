@@ -2,8 +2,10 @@
 #include <vector>
 #include "mpi.h"
 
+
 int main()
 {
+#ifdef MPIX_STREAM_NULL
     int rank, nranks;
     MPI_Init(nullptr, nullptr);
 
@@ -31,5 +33,6 @@ int main()
     }
     MPI_Barrier(MPI_COMM_WORLD);
     MPI_Finalize();
+#endif
     return 0;
 }

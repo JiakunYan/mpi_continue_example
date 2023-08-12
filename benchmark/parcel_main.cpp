@@ -7,17 +7,15 @@
 #include <deque>
 #include "mpi.h"
 #include "common.hpp"
+#include "common_mpi.hpp"
 
-#ifdef OMPI_MPI_H
-#include "mpi-ext.h"
-#define MPIX_CONT_IMMEDIATE 0
-#define MPIX_CONT_FORGET 0
-
-#ifndef OMPI_HAVE_MPI_EXT_CONTINUE
-#define MPIX_Continue_init(...) MPI_ERR_UNKNOWN
-#define MPIX_Continue(...) MPI_ERR_UNKNOWN
-#define MPIX_Continueall(...) MPI_ERR_UNKNOWN
-#endif
+#ifndef MPIX_STREAM_NULL
+#define MPIX_Stream int
+#define MPIX_STREAM_NULL 0
+#define MPIX_Stream_create(...) MPI_ERR_UNKNOWN
+#define MPIX_Stream_comm_create(...) MPI_ERR_UNKNOWN
+#define MPIX_Stream_free(...) MPI_ERR_UNKNOWN
+#define MPIX_Stream_progress(...) MPI_ERR_UNKNOWN
 #endif
 
 #define MPI_SAFECALL(x) {      \
@@ -54,10 +52,10 @@ __thread MPI_Request header_req = MPI_REQUEST_NULL;
 thread_local std::vector<int> recv_buffer(MAX_HEADER_SIZE);
 
 struct alignas(64) device_t {
-    MPIX_Stream stream;
+    MPIX_Stream stream = MPIX_STREAM_NULL;
     MPI_Comm comm;
     int max_tag;
-    device_t() : stream(MPIX_STREAM_NULL), max_tag(32767) {};
+    device_t() : max_tag(32767) {};
 };
 std::vector<device_t> g_devices;
 __thread device_t *tls_device_p;;
@@ -68,99 +66,6 @@ __thread int tls_header_tag;
 __thread int tls_next_tag = 0;
 __thread int pending_send = 0;
 __thread int pending_recv = 0;
-
-namespace detail {
-    class comp_manager_base_t {
-    public:
-        typedef int (cb_fn_t)(int error_code, void *user_data);
-        virtual ~comp_manager_base_t() = default;
-        virtual void push(std::vector<MPI_Request>&& requests, cb_fn_t *cb, void *context) = 0;
-        virtual bool progress() = 0;
-        virtual void init_thread() {};
-        virtual void free_thread() {};
-    };
-    class comp_manager_request_t : public comp_manager_base_t {
-    public:
-        struct pending_parcel_t {
-            std::vector<MPI_Request> requests;
-            cb_fn_t *cb;
-            void *context;
-        };
-        void push(std::vector<MPI_Request>&& requests, cb_fn_t *cb, void *context) override {
-            int flag;
-            MPI_SAFECALL(MPI_Testall(requests.size(), requests.data(), &flag, MPI_STATUS_IGNORE));
-            if (flag) {
-                cb(MPI_SUCCESS, context);
-            } else {
-                auto *parcel = new pending_parcel_t;
-                parcel->requests = std::move(requests);
-                parcel->cb = cb;
-                parcel->context = context;
-                pending_parcels.push_back(parcel);
-            }
-        }
-        bool progress() override {
-            if (pending_parcels.empty())
-                return false;
-            auto *parcel = pending_parcels.front();
-            pending_parcels.pop_front();
-            int flag;
-            MPI_SAFECALL(MPI_Testall(parcel->requests.size(), parcel->requests.data(), &flag, MPI_STATUS_IGNORE));
-            if (flag) {
-                parcel->cb(MPI_SUCCESS, parcel->context);
-                return true;
-            } else {
-                pending_parcels.push_back(parcel);
-                return false;
-            }
-        }
-    private:
-        static thread_local std::deque<pending_parcel_t*> pending_parcels;
-    };
-    thread_local std::deque<comp_manager_request_t::pending_parcel_t*> comp_manager_request_t::pending_parcels;
-
-    class comp_manager_continue_t : public comp_manager_base_t {
-    public:
-        explicit comp_manager_continue_t(config_t config_) : config(config_) {}
-        void push(std::vector<MPI_Request>&& requests, cb_fn_t *cb, void *context) override {
-            int cont_flag = 0;
-            if (config.use_cont_imm)
-                cont_flag |= MPIX_CONT_IMMEDIATE;
-            if (config.use_cont_forget)
-                cont_flag |= MPIX_CONT_FORGET;
-            MPI_SAFECALL(MPIX_Continueall(static_cast<int>(requests.size()), requests.data(), cb,
-                                          context, cont_flag, MPI_STATUSES_IGNORE, tls_cont_req));
-        }
-        bool progress() override {
-            if (config.use_cont_forget) {
-//                MPI_SAFECALL(MPIX_Stream_progress(MPIX_STREAM_NULL));
-            } else {
-                int flag;
-                MPI_SAFECALL(MPI_Test(&tls_cont_req, &flag, MPI_STATUS_IGNORE));
-                if (flag) {
-                    MPI_Start(&tls_cont_req);
-                }
-            }
-            return true;
-        }
-        void init_thread() override {
-            if (config.progress_type == config_t::progress_type_t::SHARED &&
-                config.comp_type == config_t::comp_type_t::CONTINUE) {
-                MPI_SAFECALL(MPIX_Continue_init(0, 0, MPI_INFO_NULL, &tls_cont_req));
-                MPI_SAFECALL(MPI_Start(&tls_cont_req));
-            }
-        }
-        void free_thread() override {
-            if (tls_cont_req != MPI_REQUEST_NULL) {
-                MPI_SAFECALL(MPI_Request_free(&tls_cont_req));
-            }
-        }
-    private:
-        static thread_local MPI_Request tls_cont_req;
-        config_t config;
-    };
-    thread_local MPI_Request comp_manager_continue_t::tls_cont_req = MPI_REQUEST_NULL;
-}
 detail::comp_manager_base_t *g_comp_manager_p;
 
 std::vector<int> *encode_header(int tag, bench::parcel_t *parcel) {
@@ -347,7 +252,12 @@ int main(int argc, char *argv[]) {
             g_comp_manager_p = new detail::comp_manager_request_t;
             break;
         case config_t::comp_type_t::CONTINUE:
-            g_comp_manager_p = new detail::comp_manager_continue_t(g_config);
+#ifdef MPIX_CONT_DEFER_COMPLETE
+            g_comp_manager_p = new detail::comp_manager_continue_t(
+                    g_config.use_cont_imm, g_config.use_cont_forget);
+#else
+            fprintf(stderr, "Cannot use MPIX Continuation with the current MPI installation.\n");
+#endif
             break;
     }
     // Initialize devices
@@ -391,7 +301,7 @@ int main(int argc, char *argv[]) {
     // Finalize streams
     for (auto & device : g_devices) {
         MPI_Comm_free(&device.comm);
-        if (device.stream != MPIX_STREAM_NULL)
+    if (device.stream != MPIX_STREAM_NULL)
             MPIX_Stream_free(&device.stream);
     }
     delete g_comp_manager_p;

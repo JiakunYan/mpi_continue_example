@@ -1,6 +1,7 @@
 #ifndef MPI_CONTINUE_EXAMPLE_COMMON_MPI_HPP
 #define MPI_CONTINUE_EXAMPLE_COMMON_MPI_HPP
 
+#include "mpi.h"
 #include <deque>
 
 #define MPI_SAFECALL(x) {      \
@@ -62,6 +63,7 @@ namespace detail {
     };
     thread_local std::deque<comp_manager_request_t::pending_parcel_t*> comp_manager_request_t::pending_parcels;
 
+#ifdef MPIX_CONT_DEFER_COMPLETE
     class comp_manager_continue_t : public comp_manager_base_t {
     public:
         explicit comp_manager_continue_t(int use_cont_imm, int use_cont_forget) {
@@ -106,6 +108,8 @@ namespace detail {
         } config;
     };
     thread_local MPI_Request comp_manager_continue_t::tls_cont_req = MPI_REQUEST_NULL;
+#endif
+
 }
 
 #endif //MPI_CONTINUE_EXAMPLE_COMMON_MPI_HPP
