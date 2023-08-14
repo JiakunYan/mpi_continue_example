@@ -18,8 +18,6 @@ struct config_t {
 config_t g_config;
 detail::comp_manager_base_t *g_comp_manager_p;
 int g_rank, g_nranks;
-MPIX_Stream stream;
-MPI_Comm comm;
 
 int receiver_callback(int error_code, void *user_data) {
     int *counter = static_cast<int*>(user_data);
@@ -38,9 +36,9 @@ void send_fn() {
             if (g_config.use_diff_tag) {
                 tag = j;
             }
-            MPI_SAFECALL(MPI_Send(buffer.data(), buffer.size(), MPI_BYTE, 1 - g_rank, tag, comm));
+            MPI_SAFECALL(MPI_Send(buffer.data(), buffer.size(), MPI_BYTE, 1 - g_rank, tag, MPI_COMM_WORLD));
         }
-        MPI_Recv(signal, 1, MPI_BYTE, 1 - g_rank, 0, comm, MPI_STATUS_IGNORE);
+        MPI_Recv(signal, 1, MPI_BYTE, 1 - g_rank, 0, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
     }
     MPI_Barrier(MPI_COMM_WORLD);
     auto end = std::chrono::high_resolution_clock::now();
@@ -67,14 +65,14 @@ void recv_fn() {
                     tag = g_config.nmsgs - j - 1;
                 }
             }
-            MPI_SAFECALL(MPI_Irecv(recv_buf.data(), recv_buf.size(), MPI_BYTE, 1 - g_rank, tag, comm, &requests[0]));
+            MPI_SAFECALL(MPI_Irecv(recv_buf.data(), recv_buf.size(), MPI_BYTE, 1 - g_rank, tag, MPI_COMM_WORLD, &requests[0]));
             g_comp_manager_p->push(std::move(requests), receiver_callback, &counter);
         }
         while (counter) {
-            MPIX_Stream_progress(stream);
+            MPIX_Stream_progress(MPIX_STREAM_NULL);
             g_comp_manager_p->progress();
         }
-        MPI_Send(signal, 1, MPI_BYTE, 1 - g_rank, 0, comm);
+        MPI_Send(signal, 1, MPI_BYTE, 1 - g_rank, 0, MPI_COMM_WORLD);
     }
     MPI_Barrier(MPI_COMM_WORLD);
 }
@@ -113,8 +111,6 @@ int main(int argc, char *argv[]) {
             g_comp_manager_p = new detail::comp_manager_continue_t(1, 1);
             break;
     }
-    MPI_SAFECALL(MPIX_Stream_create(MPI_INFO_NULL, &stream));
-    MPIX_Stream_comm_create(MPI_COMM_WORLD, stream, &comm);
 
     g_comp_manager_p->init_thread();
     if (g_rank == 0) {
