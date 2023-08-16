@@ -72,7 +72,6 @@ int main(int argc, char *argv[]) {
     args_parser.add("use-diff-order", required_argument, (int*)&g_config.use_diff_order);
     args_parser.parse_args(argc, argv);
     // initialize MPI
-    setenv("MPIR_CVAR_CH4_RESERVE_VCIS", "1", true);
     MPI_SAFECALL(MPI_Init(nullptr, nullptr));
     MPI_SAFECALL(MPI_Comm_size(MPI_COMM_WORLD, &g_nranks));
     MPI_SAFECALL(MPI_Comm_rank(MPI_COMM_WORLD, &g_rank));
