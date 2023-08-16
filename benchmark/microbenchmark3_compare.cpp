@@ -26,7 +26,7 @@ int receiver_callback(int error_code, void *user_data) {
 }
 
 void send_fn() {
-    char signal[1];
+    int total_test_counter = 0;
     std::vector<char> buffer(g_config.msg_size);
     MPI_Barrier(MPI_COMM_WORLD);
     auto start = std::chrono::high_resolution_clock::now();
@@ -38,12 +38,15 @@ void send_fn() {
             }
             MPI_SAFECALL(MPI_Send(buffer.data(), buffer.size(), MPI_BYTE, 1 - g_rank, tag, MPI_COMM_WORLD));
         }
-        MPI_Recv(signal, 1, MPI_BYTE, 1 - g_rank, 0, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+        int test_counter;
+        MPI_Recv(&test_counter, 1, MPI_INT, 1 - g_rank, 0, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+        total_test_counter += test_counter;
     }
     MPI_Barrier(MPI_COMM_WORLD);
     auto end = std::chrono::high_resolution_clock::now();
     auto total_time = std::chrono::duration_cast<std::chrono::duration<double>>(end - start).count();
     std::cout << "Result: {"
+              << "\"Failed test rate\": " << (double)(total_test_counter - g_config.nmsgs * g_config.niters) / total_test_counter << ", "
               << "\"Average time per request (us)\": " << total_time * 1e6 / g_config.niters / g_config.nmsgs << ", "
               << "\"Average time per iter (us)\": " << total_time * 1e6 / g_config.niters << ", "
               << "\"Total time (s)\": " << total_time << " }"
@@ -51,7 +54,6 @@ void send_fn() {
 }
 
 void recv_fn() {
-    char signal[1];
     std::vector<char> recv_buf(g_config.msg_size);
     MPI_Barrier(MPI_COMM_WORLD);
     for (int i = 0; i < g_config.niters; ++i) {
@@ -68,11 +70,14 @@ void recv_fn() {
             MPI_SAFECALL(MPI_Irecv(recv_buf.data(), recv_buf.size(), MPI_BYTE, 1 - g_rank, tag, MPI_COMM_WORLD, &requests[0]));
             g_comp_manager_p->push(std::move(requests), receiver_callback, &counter);
         }
+        int test_counter = 0;
         while (counter) {
-            MPIX_Stream_progress(MPIX_STREAM_NULL);
+            if (g_config.comp_type == config_t::comp_type_t::CONTINUE)
+                MPIX_Stream_progress(MPIX_STREAM_NULL);
+            ++test_counter;
             g_comp_manager_p->progress();
         }
-        MPI_Send(signal, 1, MPI_BYTE, 1 - g_rank, 0, MPI_COMM_WORLD);
+        MPI_Send(&test_counter, 1, MPI_INT, 1 - g_rank, 0, MPI_COMM_WORLD);
     }
     MPI_Barrier(MPI_COMM_WORLD);
 }
